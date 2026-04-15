@@ -348,6 +348,40 @@ def extract_directbc_dataset(
             ee_z=ee_z,
             title="Final transformed marker + EE trajectories (x vs z)",
         )
+    
+    # =========================================================
+    # Remove timesteps with NaNs (critical)
+    # =========================================================
+    # Build mask of valid timesteps
+
+    mask = (
+    np.isfinite(ee_x) &
+    np.isfinite(ee_z) &
+    np.isfinite(marker_data_centered["marker_2"]["x"]) &
+    np.isfinite(marker_data_centered["marker_2"]["z"])
+    )
+
+    # also ensure required markers are valid
+    for m in required_markers:
+        mask &= np.isfinite(marker_data_centered[m]["x"])
+        mask &= np.isfinite(marker_data_centered[m]["z"])
+
+    n_before = len(mask)
+    n_after = np.sum(mask)
+
+    print(f"Removing NaNs: kept {n_after}/{n_before} timesteps")
+
+    if n_after == 0:
+        raise ValueError("All data points are NaN after filtering.")
+
+    # Apply mask everywhere
+    ee_x = ee_x[mask]
+    ee_y = ee_y[mask]
+    ee_z = ee_z[mask]
+
+    for name in marker_names:
+        for c in ["x", "y", "z"]:
+            marker_data_centered[name][c] = marker_data_centered[name][c][mask]
 
     # =========================================================
     # Sanity check lengths
@@ -410,6 +444,21 @@ def extract_directbc_dataset(
     # =========================================================
     # Save
     # =========================================================
+    
+    def assert_no_nans(name, arr):
+        if not np.all(np.isfinite(arr)):
+            n_nan = np.isnan(arr).sum()
+            n_inf = np.isinf(arr).sum()
+            raise ValueError(
+                f"{name} contains NaNs/Infs | NaNs: {n_nan}, Infs: {n_inf}, shape: {arr.shape}"
+            )
+
+    # ---- checks ----
+    assert_no_nans("qs", qs)
+    assert_no_nans("xb", xb)
+    assert_no_nans("lambdas", lambdas)
+    assert_no_nans("valid", valid.astype(float))  # bool → safe cast
+    
     np.savez(
         output_npz_path,
         qs=qs,
@@ -425,6 +474,8 @@ def extract_directbc_dataset(
     print("lambdas shape:", lambdas.shape)
 
     return qs, xb, idx_b, lambdas
+
+
 def plot_qs_snapshots(qs, traj_idx=0, title=None, every_step=1):
     """
     Plot the rod configuration at multiple time steps.

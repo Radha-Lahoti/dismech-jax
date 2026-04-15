@@ -15,7 +15,7 @@ class Dataset(eqx.Module):
     qs: jax.Array        # (n_traj, T, dof)
     xb: jax.Array        # (n_traj, T, n_b)
     idx_b: jax.Array     # (n_b,) or (n_traj, n_b)
-    lambdas: jax.Array   # (T,)
+    lambdas: jax.Array   # (n_traj, T)
     valid: jax.Array     # (n_traj, T)
 
     @staticmethod
@@ -74,16 +74,29 @@ def predict(
     iters=5,
     ls_steps=10,
 ):
-    bc = djx.BatchedDirectBC(idx_b=idx_b, xb=xb, lambdas=lambdas)
-    rod = base.with_bc(bc)
-    pred = rod.solve(
-        model,
-        lambdas,
-        aux,
-        max_dlambda=max_dlambda,
-        iters=iters,
-        ls_steps=ls_steps,
-    )
+    n_traj = xb.shape[0]
+
+    # handle shared vs per-trajectory lambdas
+    if lambdas.ndim == 1:
+        lam_all = jnp.broadcast_to(lambdas, (n_traj, lambdas.shape[0]))
+    else:
+        lam_all = lambdas
+        
+    idx_all = jnp.broadcast_to(idx_b, (n_traj, idx_b.shape[0]))
+
+    def predict_one(ib, xb_i, lam_i):
+        bc = djx.DirectBC(idx_b=ib, xb=xb_i, lambdas=lam_i)
+        rod = base.with_bc(bc)
+        return rod.solve(
+            model,
+            lam_i,
+            aux,
+            max_dlambda=max_dlambda,
+            iters=iters,
+            ls_steps=ls_steps,
+        )
+
+    pred = jax.vmap(predict_one)(idx_all, xb, lam_all)
     return pred
 
 
@@ -187,6 +200,18 @@ def train_model(
     )
 
     opt = optax.adam(schedule)
+    # Optax: Adam
+    # opt = optax.chain(
+    #     optax.clip_by_global_norm(1.0),
+    #     optax.adam(learning_rate=schedule),
+    # ) 
+    # Optax: AdaBelief
+    # opt = optax.chain(
+    #     optax.clip_by_global_norm(1.0),
+    #     optax.adabelief(learning_rate=schedule),
+    # )   
+
+
     opt_state = opt.init(model)
 
     # --- training step ---
