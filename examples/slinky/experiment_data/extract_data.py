@@ -397,7 +397,7 @@ def extract_directbc_dataset(
     # =========================================================
     # Lambdas
     # =========================================================
-    lambdas = np.linspace(0.0, 1.0, T)
+    lambdas = np.linspace(0.0, 1.0, T)[None, ...]
 
     # =========================================================
     # Add trajectory dimension
@@ -405,6 +405,8 @@ def extract_directbc_dataset(
     qs = qs[None, :, :]
     xb = xb[None, :, :]
 
+    # All valid for single dataset
+    valid = np.full((qs.shape[0], qs.shape[1]), True)
     # =========================================================
     # Save
     # =========================================================
@@ -414,6 +416,7 @@ def extract_directbc_dataset(
         xb=xb,
         idx_b=idx_b,
         lambdas=lambdas,
+        valid=valid,
     )
 
     print("qs shape:", qs.shape)

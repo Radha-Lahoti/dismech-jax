@@ -16,6 +16,7 @@ class Dataset(eqx.Module):
     xb: jax.Array        # (n_traj, T, n_b)
     idx_b: jax.Array     # (n_b,) or (n_traj, n_b)
     lambdas: jax.Array   # (T,)
+    valid: jax.Array     # (n_traj, T)
 
     @staticmethod
     def load(path):
@@ -25,8 +26,8 @@ class Dataset(eqx.Module):
             xb=jnp.asarray(data["xb"]),
             idx_b=jnp.asarray(data["idx_b"]),
             lambdas=jnp.asarray(data["lambdas"]),
+            valid=jnp.asarray(data["valid"]),
         )
-
 
 # =========================================================
 # Base slinky rod (fixed)
@@ -97,6 +98,7 @@ def traj_loss(
     xb,
     lambdas,
     qs_true,
+    valid,
     max_dlambda=5e-3,
     iters=5,
     ls_steps=10,
@@ -112,8 +114,9 @@ def traj_loss(
         iters=iters,
         ls_steps=ls_steps,
     )
-
-    return jnp.mean((qs_pred - qs_true) ** 2)
+    err = (qs_pred - qs_true) ** 2
+    masked_err = jnp.where(valid[..., None], err, 0.0)
+    return jnp.sum(masked_err) / jnp.sum(valid)
 
 
 def dataset_loss(
@@ -134,19 +137,20 @@ def dataset_loss(
         idx_all = data.idx_b
 
     losses = jax.vmap(
-        lambda ib, xb, qs: traj_loss(
+        lambda ib, xb, qs, _lambda, valid: traj_loss(
             model,
             base,
             aux,
             ib,
             xb,
-            data.lambdas,
+            _lambda,
             qs,
+            valid,
             max_dlambda=max_dlambda,
             iters=iters,
             ls_steps=ls_steps,
         )
-    )(idx_all, data.xb, data.qs)
+    )(idx_all, data.xb, data.qs, data.lambdas, data.valid)
 
     return jnp.mean(losses)
 
