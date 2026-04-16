@@ -48,13 +48,18 @@ def get_slinky(properties):
 
     if properties.mass is not None:
         mass = properties.mass
-        f = jnp.array([
-            0, 0, mass / 4 * -9.81,
-            0, 0, 0,
-            mass / 2 * -9.81,
-            0, 0, 0,
-            mass / 4 * -9.81,
-        ])
+        N = properties.N
+        assert N >= 2
+
+        g = -9.81
+        f = jnp.zeros(4 * N - 1)
+
+        # set all node z entries as interior-node weights first
+        f = f.at[2::4].set(mass / (N - 1) * g)
+
+        # correct the two end nodes to half-weight
+        f = f.at[2].set(mass / (2 * (N - 1)) * g)      # first node z
+        f = f.at[4 * N - 2].set(mass / (2 * (N - 1)) * g)  # last node z
         rod = eqx.tree_at(lambda r: r.E_ext, rod, djx.Gravity(f))
 
     return rod, aux
@@ -199,12 +204,12 @@ def train_model(
         alpha=0.1,
     )
 
-    opt = optax.adam(schedule)
+    # opt = optax.adam(schedule)
     # Optax: Adam
-    # opt = optax.chain(
-    #     optax.clip_by_global_norm(1.0),
-    #     optax.adam(learning_rate=schedule),
-    # ) 
+    opt = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(learning_rate=lr),
+    ) 
     # Optax: AdaBelief
     # opt = optax.chain(
     #     optax.clip_by_global_norm(1.0),

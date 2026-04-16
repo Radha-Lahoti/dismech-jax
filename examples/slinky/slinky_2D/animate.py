@@ -1,37 +1,78 @@
 import numpy as np
 import plotly.graph_objects as go
-def animate(qs):
-    frames = []
-    all_coords = np.vstack([qs[:, 0:3], qs[:, 4:7], qs[:, 8:11]])
+
+
+def animate(qs, n_nodes=None, frame_duration=50):
+    """
+    Animate rod configurations from qs.
+
+    Parameters
+    ----------
+    qs : array-like
+        Shape (T, dof)
+    n_nodes : int or None
+        Number of nodes. If None, inferred from dof via dof = 4*n_nodes - 1
+    frame_duration : int
+        Duration per frame in ms
+    """
+    qs = np.asarray(qs)
+
+    if qs.ndim != 2:
+        raise ValueError("qs must have shape (T, dof)")
+
+    T, dof = qs.shape
+
+    if n_nodes is None:
+        if (dof + 1) % 4 != 0:
+            raise ValueError(
+                f"Cannot infer n_nodes from dof={dof}. Expected dof = 4*n_nodes - 1."
+            )
+        n_nodes = (dof + 1) // 4
+
+    expected_dof = 4 * n_nodes - 1
+    if dof != expected_dof:
+        raise ValueError(
+            f"Inconsistent n_nodes={n_nodes} for dof={dof}. Expected dof={expected_dof}."
+        )
+
+    # Position block starts for nodes only; skips edge DOFs naturally
+    pos_starts = [4 * i for i in range(n_nodes)]
+
+    # Collect all node coordinates across all timesteps for fixed axis limits
+    all_coords = np.vstack([qs[:, s:s+3] for s in pos_starts])
 
     mins = all_coords.min(axis=0)
     maxs = all_coords.max(axis=0)
-    center = (mins + maxs) / 2
+    center = (mins + maxs) / 2.0
 
-    # Get max range for cube domain
     max_range = np.max(maxs - mins)
-    buffer = max_range * 0.1
+    buffer = max(0.1 * max_range, 1e-6)
 
-    # Fixed limits for all frames
-    plot_limit = (max_range / 2) + buffer
+    plot_limit = (max_range / 2.0) + buffer
     x_range = [center[0] - plot_limit, center[0] + plot_limit]
     y_range = [center[1] - plot_limit, center[1] + plot_limit]
     z_range = [center[2] - plot_limit, center[2] + plot_limit]
 
-    # Build frames
-    for t in range(len(qs)):
+    frames = []
+    for t in range(T):
         row = qs[t]
-        q_points = [row[0:3], row[4:7], row[8:11]]
+        q_points = [row[s:s+3] for s in pos_starts]
+
+        x = [p[0] for p in q_points]
+        y = [p[1] for p in q_points]
+        z = [p[2] for p in q_points]
+
         frames.append(
             go.Frame(
                 data=[
                     go.Scatter3d(
-                        x=[q_points[0][0], q_points[1][0], q_points[2][0]],
-                        y=[q_points[0][1], q_points[1][1], q_points[2][1]],
-                        z=[q_points[0][2], q_points[1][2], q_points[2][2]],
+                        x=x,
+                        y=y,
+                        z=z,
                         mode="lines+markers",
                         line=dict(color="black", width=7),
-                    ),
+                        marker=dict(size=5),
+                    )
                 ],
                 name=str(t),
             )
@@ -44,7 +85,7 @@ def animate(qs):
                 xaxis=dict(range=x_range, autorange=False),
                 yaxis=dict(range=y_range, autorange=False),
                 zaxis=dict(range=z_range, autorange=False),
-                aspectmode="cube",  # Forces 1:1:1 scale visuals
+                aspectmode="cube",
             ),
             updatemenus=[
                 {
@@ -53,7 +94,7 @@ def animate(qs):
                             "args": [
                                 None,
                                 {
-                                    "frame": {"duration": 50, "redraw": True},
+                                    "frame": {"duration": frame_duration, "redraw": True},
                                     "fromcurrent": True,
                                 },
                             ],
@@ -97,4 +138,5 @@ def animate(qs):
         ),
         frames=frames,
     )
+
     return fig

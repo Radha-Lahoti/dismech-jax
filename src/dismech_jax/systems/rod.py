@@ -366,6 +366,7 @@ class Rod(System[TripletState]):
         dm_edges = l_ks * A * material.density * factor
         edge_indices = jnp.arange(N - 1) * 4 + 3
         mass = mass.at[edge_indices].set(dm_edges)
+        print("total mass:", jnp.sum(mass))
         return mass
 
     @property
