@@ -191,20 +191,6 @@ def plot_energy_landscape_from_path(
 ):
     """
     Plot energy contours and overlay a visited strain trajectory.
-
-    Parameters
-    ----------
-    model : callable
-        Learned energy model, called as model(del_strain) -> scalar
-    path : (T, n_strain)
-        Visited reduced strain path for one trajectory and one triplet
-    spec : EnergyLandscapeSpec
-        Plot configuration
-    ax : matplotlib axis or None
-
-    Returns
-    -------
-    fig, ax, out
     """
     x_path, y_path = project_path_to_2d(
         path, spec.strain_x_idx, spec.strain_y_idx
@@ -281,17 +267,27 @@ def plot_energy_landscape_from_path(
 # =========================================================
 # Snapshot helper during training
 # =========================================================
+def _snapshot_stem(epoch=None, tag=None):
+    if tag is not None:
+        return f"energy_landscape_{tag}"
+    if epoch is None:
+        raise ValueError("Either epoch or tag must be provided.")
+    return f"energy_landscape_epoch_{int(epoch):04d}"
+
+
 def save_energy_landscape_snapshot_from_solution(
     model,
     del_strains,
     spec: EnergyLandscapeSpec,
     save_dir,
-    epoch,
+    epoch=None,
+    tag=None,
     qs=None,
     dpi=180,
     close_fig=True,
 ):
     os.makedirs(save_dir, exist_ok=True)
+    stem = _snapshot_stem(epoch=epoch, tag=tag)
 
     path = extract_strain_path(
         del_strains,
@@ -307,7 +303,7 @@ def save_energy_landscape_snapshot_from_solution(
     )
 
     fig.savefig(
-        os.path.join(save_dir, f"energy_landscape_epoch_{epoch:04d}.png"),
+        os.path.join(save_dir, f"{stem}.png"),
         bbox_inches="tight",
         dpi=dpi,
     )
@@ -326,7 +322,7 @@ def save_energy_landscape_snapshot_from_solution(
     save_dict["del_strains"] = np.asarray(del_strains)
 
     np.savez(
-        os.path.join(save_dir, f"energy_landscape_epoch_{epoch:04d}.npz"),
+        os.path.join(save_dir, f"{stem}.npz"),
         **save_dict,
     )
 
@@ -365,7 +361,11 @@ def make_energy_snapshot_fn(
             idx_b_plot = ds.idx_b[traj_idx]
 
         xb_plot = ds.xb[traj_idx]
-        lambdas_plot = ds.lambdas
+
+        if ds.lambdas.ndim == 1:
+            lambdas_plot = ds.lambdas
+        else:
+            lambdas_plot = ds.lambdas[traj_idx]
 
         spec_local = replace(spec)
         spec_local.traj_idx = 0  # local solve is single-trajectory now
@@ -388,12 +388,14 @@ def make_energy_snapshot_fn(
 
         _ = auxs  # retained for debugging if you later want to save/use it
 
+        tag = "initial" if epoch == -1 else None
         save_energy_landscape_snapshot_from_solution(
             model=model,
             del_strains=del_strains,
             spec=spec_local,
             save_dir=save_dir,
-            epoch=epoch,
+            epoch=None if tag is not None else epoch,
+            tag=tag,
             qs=qs,
             dpi=dpi,
             close_fig=True,

@@ -13,6 +13,26 @@ from run_architectures import (
 
 
 # =========================================================
+# Helpers
+# =========================================================
+def _is_successful_result(r: dict) -> bool:
+    return bool(r.get("success", True))
+
+
+def _successful_results(seed_results: list[dict]) -> list[dict]:
+    return [r for r in seed_results if _is_successful_result(r)]
+
+
+def _final_or_nan(hist):
+    if hist is None:
+        return np.nan
+    arr = np.asarray(hist, dtype=float)
+    if arr.size == 0:
+        return np.nan
+    return float(arr[-1])
+
+
+# =========================================================
 # 1) Run seed ablation
 # =========================================================
 def run_seed_ablation(
@@ -86,27 +106,75 @@ def run_seed_ablation(
 # 2) Summaries
 # =========================================================
 def get_seed_summary(seed_results: list[dict]) -> dict:
-    final_train = np.array([r["train_hist"][-1] for r in seed_results], dtype=float)
-    final_valid = np.array([r["valid_hist"][-1] for r in seed_results], dtype=float)
     seeds = np.array([r["cfg"].seed for r in seed_results], dtype=int)
+    success_mask = np.array([_is_successful_result(r) for r in seed_results], dtype=bool)
 
-    best_idx = int(np.argmin(final_valid))
+    final_train = np.array([_final_or_nan(r.get("train_hist", None)) for r in seed_results], dtype=float)
+    final_valid = np.array([_final_or_nan(r.get("valid_hist", None)) for r in seed_results], dtype=float)
+
+    successful = _successful_results(seed_results)
+
+    if len(successful) > 0:
+        successful_final_valid = np.array(
+            [_final_or_nan(r.get("valid_hist", None)) for r in successful],
+            dtype=float,
+        )
+        best_success_idx_local = int(np.nanargmin(successful_final_valid))
+        best_success_result = successful[best_success_idx_local]
+        best_seed = int(best_success_result["cfg"].seed)
+
+        valid_success_vals = successful_final_valid
+        train_success_vals = np.array(
+            [_final_or_nan(r.get("train_hist", None)) for r in successful],
+            dtype=float,
+        )
+
+        mean_final_train = float(np.nanmean(train_success_vals))
+        std_final_train = float(np.nanstd(train_success_vals))
+        mean_final_valid = float(np.nanmean(valid_success_vals))
+        std_final_valid = float(np.nanstd(valid_success_vals))
+        median_final_valid = float(np.nanmedian(valid_success_vals))
+        min_final_valid = float(np.nanmin(valid_success_vals))
+        max_final_valid = float(np.nanmax(valid_success_vals))
+    else:
+        best_success_result = None
+        best_seed = None
+        mean_final_train = np.nan
+        std_final_train = np.nan
+        mean_final_valid = np.nan
+        std_final_valid = np.nan
+        median_final_valid = np.nan
+        min_final_valid = np.nan
+        max_final_valid = np.nan
+
+    failed_seed_info = []
+    for r in seed_results:
+        if not _is_successful_result(r):
+            failed_seed_info.append(
+                {
+                    "seed": int(r["cfg"].seed),
+                    "failure_reason": r.get("failure_reason", "unknown_failure"),
+                }
+            )
 
     return {
         "n_seeds": len(seed_results),
+        "n_success": int(np.sum(success_mask)),
+        "n_failed": int(np.sum(~success_mask)),
+        "success_mask": success_mask,
         "seeds": seeds,
         "final_train": final_train,
         "final_valid": final_valid,
-        "best_idx": best_idx,
-        "best_seed": int(seeds[best_idx]),
-        "best_result": seed_results[best_idx],
-        "mean_final_train": float(np.mean(final_train)),
-        "std_final_train": float(np.std(final_train)),
-        "mean_final_valid": float(np.mean(final_valid)),
-        "std_final_valid": float(np.std(final_valid)),
-        "median_final_valid": float(np.median(final_valid)),
-        "min_final_valid": float(np.min(final_valid)),
-        "max_final_valid": float(np.max(final_valid)),
+        "best_seed": best_seed,
+        "best_result": best_success_result,
+        "mean_final_train": mean_final_train,
+        "std_final_train": std_final_train,
+        "mean_final_valid": mean_final_valid,
+        "std_final_valid": std_final_valid,
+        "median_final_valid": median_final_valid,
+        "min_final_valid": min_final_valid,
+        "max_final_valid": max_final_valid,
+        "failed_seed_info": failed_seed_info,
     }
 
 
@@ -120,6 +188,8 @@ def print_seed_summary(all_seed_results: dict):
 
         print(f"\nArchitecture: {arch_name}")
         print(f"  n_seeds           : {s['n_seeds']}")
+        print(f"  n_success         : {s['n_success']}")
+        print(f"  n_failed          : {s['n_failed']}")
         print(f"  best_seed         : {s['best_seed']}")
         print(f"  best final valid  : {s['min_final_valid']:.6e}")
         print(f"  worst final valid : {s['max_final_valid']:.6e}")
@@ -128,6 +198,11 @@ def print_seed_summary(all_seed_results: dict):
         print(f"  median final valid: {s['median_final_valid']:.6e}")
         print(f"  mean final train  : {s['mean_final_train']:.6e}")
         print(f"  std  final train  : {s['std_final_train']:.6e}")
+
+        if s["n_failed"] > 0:
+            print("  failed seeds      :")
+            for item in s["failed_seed_info"]:
+                print(f"    seed {item['seed']}: {item['failure_reason']}")
 
 
 def save_seed_summary_json(all_seed_results: dict, output_dir: str):
@@ -138,18 +213,21 @@ def save_seed_summary_json(all_seed_results: dict, output_dir: str):
         s = get_seed_summary(seed_results)
         payload[arch_name] = {
             "n_seeds": int(s["n_seeds"]),
+            "n_success": int(s["n_success"]),
+            "n_failed": int(s["n_failed"]),
             "seeds": [int(x) for x in s["seeds"]],
-            "final_train": [float(x) for x in s["final_train"]],
-            "final_valid": [float(x) for x in s["final_valid"]],
-            "best_idx": int(s["best_idx"]),
-            "best_seed": int(s["best_seed"]),
-            "mean_final_train": float(s["mean_final_train"]),
-            "std_final_train": float(s["std_final_train"]),
-            "mean_final_valid": float(s["mean_final_valid"]),
-            "std_final_valid": float(s["std_final_valid"]),
-            "median_final_valid": float(s["median_final_valid"]),
-            "min_final_valid": float(s["min_final_valid"]),
-            "max_final_valid": float(s["max_final_valid"]),
+            "success_mask": [bool(x) for x in s["success_mask"]],
+            "final_train": [float(x) if np.isfinite(x) else None for x in s["final_train"]],
+            "final_valid": [float(x) if np.isfinite(x) else None for x in s["final_valid"]],
+            "best_seed": None if s["best_seed"] is None else int(s["best_seed"]),
+            "mean_final_train": None if not np.isfinite(s["mean_final_train"]) else float(s["mean_final_train"]),
+            "std_final_train": None if not np.isfinite(s["std_final_train"]) else float(s["std_final_train"]),
+            "mean_final_valid": None if not np.isfinite(s["mean_final_valid"]) else float(s["mean_final_valid"]),
+            "std_final_valid": None if not np.isfinite(s["std_final_valid"]) else float(s["std_final_valid"]),
+            "median_final_valid": None if not np.isfinite(s["median_final_valid"]) else float(s["median_final_valid"]),
+            "min_final_valid": None if not np.isfinite(s["min_final_valid"]) else float(s["min_final_valid"]),
+            "max_final_valid": None if not np.isfinite(s["max_final_valid"]) else float(s["max_final_valid"]),
+            "failed_seed_info": s["failed_seed_info"],
         }
 
     with open(os.path.join(output_dir, "seed_summary.json"), "w") as f:
@@ -169,10 +247,15 @@ def plot_seed_loss_envelope(
     if which not in ("train", "valid"):
         raise ValueError("which must be 'train' or 'valid'")
 
+    good_results = _successful_results(seed_results)
+    if len(good_results) == 0:
+        print(f"[plot_seed_loss_envelope] No successful runs available for {which}. Skipping plot.")
+        return
+
     losses = []
     seeds = []
 
-    for r in seed_results:
+    for r in good_results:
         losses.append(r[f"{which}_hist"])
         seeds.append(r["cfg"].seed)
 
@@ -240,15 +323,20 @@ def plot_seed_prediction_envelope(
     if component not in ("x", "z"):
         raise ValueError("component must be 'x' or 'z'")
 
+    good_results = _successful_results(seed_results)
+    if len(good_results) == 0:
+        print(f"[plot_seed_prediction_envelope] No successful runs available. Skipping plot.")
+        return
+
     comp_idx = x_idx if component == "x" else z_idx
     pred_key = f"{split}_pred"
     truth_key = f"{split}_truth"
 
-    seeds = np.array([r["cfg"].seed for r in seed_results], dtype=int)
-    preds = np.asarray([r[pred_key][traj_idx, :, comp_idx] for r in seed_results], dtype=float)
-    truth = np.asarray(seed_results[0][truth_key][traj_idx, :, comp_idx], dtype=float)
+    seeds = np.array([r["cfg"].seed for r in good_results], dtype=int)
+    preds = np.asarray([r[pred_key][traj_idx, :, comp_idx] for r in good_results], dtype=float)
+    truth = np.asarray(good_results[0][truth_key][traj_idx, :, comp_idx], dtype=float)
 
-    final_valid = np.asarray([r["valid_hist"][-1] for r in seed_results], dtype=float)
+    final_valid = np.asarray([r["valid_hist"][-1] for r in good_results], dtype=float)
     best_idx = int(np.argmin(final_valid))
     best_seed = int(seeds[best_idx])
 
@@ -304,15 +392,20 @@ def plot_seed_prediction_all_curves(
     if component not in ("x", "z"):
         raise ValueError("component must be 'x' or 'z'")
 
+    good_results = _successful_results(seed_results)
+    if len(good_results) == 0:
+        print(f"[plot_seed_prediction_all_curves] No successful runs available. Skipping plot.")
+        return
+
     comp_idx = x_idx if component == "x" else z_idx
     pred_key = f"{split}_pred"
     truth_key = f"{split}_truth"
 
-    seeds = np.array([r["cfg"].seed for r in seed_results], dtype=int)
-    preds = np.asarray([r[pred_key][traj_idx, :, comp_idx] for r in seed_results], dtype=float)
-    truth = np.asarray(seed_results[0][truth_key][traj_idx, :, comp_idx], dtype=float)
+    seeds = np.array([r["cfg"].seed for r in good_results], dtype=int)
+    preds = np.asarray([r[pred_key][traj_idx, :, comp_idx] for r in good_results], dtype=float)
+    truth = np.asarray(good_results[0][truth_key][traj_idx, :, comp_idx], dtype=float)
 
-    final_valid = np.asarray([r["valid_hist"][-1] for r in seed_results], dtype=float)
+    final_valid = np.asarray([r["valid_hist"][-1] for r in good_results], dtype=float)
     best_idx = int(np.argmin(final_valid))
     best_seed = int(seeds[best_idx])
 
@@ -360,7 +453,15 @@ def plot_seed_final_loss_bar(
 
     for arch_name in arch_names:
         seed_results = all_seed_results[arch_name]
-        final_valid = np.asarray([r["valid_hist"][-1] for r in seed_results], dtype=float)
+        good_results = _successful_results(seed_results)
+
+        if len(good_results) == 0:
+            means.append(np.nan)
+            stds.append(np.nan)
+            bests.append(np.nan)
+            continue
+
+        final_valid = np.asarray([r["valid_hist"][-1] for r in good_results], dtype=float)
         means.append(np.mean(final_valid))
         stds.append(np.std(final_valid))
         bests.append(np.min(final_valid))

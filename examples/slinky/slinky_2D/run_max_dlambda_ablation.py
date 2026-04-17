@@ -6,15 +6,11 @@ from typing import Optional
 import numpy as np
 import matplotlib.pyplot as plt
 
-import jax
-import jax.numpy as jnp
-
-from util import Dataset, get_slinky, predict, train_model
 from run_architectures import (
     ArchSpec,
     SweepConfig,
     build_architecture_registry,
-    make_model_params,
+    run_one_architecture,
 )
 
 
@@ -23,77 +19,159 @@ from run_architectures import (
 # =========================================================
 @dataclass(frozen=True)
 class MaxDlambdaAblationConfig:
-    # ---- reuse most of your architecture/training flags ----
-    der_K_diag: tuple[float, float] = (0.1, 0.1)
-    der_K_chol: tuple[float, float, float] = (0.1, 0.0, 0.1)
+    # -------------------------
+    # Keep these aligned with SweepConfig defaults / fields
+    # -------------------------
+    der_K_diag: tuple[float, float] = (0.2, 0.01)
+    der_K_chol: tuple[float, float, float] = (0.2, 0.0, 0.01)
 
-    hidden: tuple[int, ...] = (10, 10)
+    hidden: tuple[int, ...] = (10,)
     corr_factor: float = 1.0
     input_mode: str = "raw"
     zero_reference: bool = True
     activation: str = "softplus"
-    seed: int = 0
 
-    n_epochs: int = 200
+    n_epochs: int = 100
     lr: float = 1e-2
+    seed: int = 0
+    seed_list: tuple[int, ...] = (0,)
+
     valid_every: int = 1
-
-    # ---- solver settings for this ablation ----
-    iters: int = 20
-    ls_steps: int = 10
-
-    # max_dlambda sweep: default logspace from 1e-2 to 1
     max_dlambda_values: tuple[float, ...] = (
         1e-2, 2e-2, 5e-2,
         1e-1, 2e-1, 5e-1,
         1.0,
     )
-
-    # stop testing larger values for one architecture once it fails
-    stop_after_first_failure: bool = True
-
-    # optional: also reject if final prediction contains NaN/Inf
-    check_predictions: bool = True
+    iters: int = 5
+    ls_steps: int = 10
+    abs_tol: float = 1e-8
+    rel_tol: float = 1e-6
+    fail_on_nonconvergence: bool = False
 
     output_dir: str = "max_dlambda_ablation_outputs"
-    save_json: bool = True
     save_npz: bool = True
     save_plots: bool = True
     verbose: bool = True
+    continue_on_failure: bool = True
+
+    # -------------------------
+    # Ablation-only controls
+    # -------------------------
+    stop_after_first_failure: bool = False
+    strict_finite_check: bool = False
+    save_summary_json: bool = True
+    save_summary_plots: bool = True
 
 
 # =========================================================
 # Helpers
 # =========================================================
-def _to_float(x):
-    return float(np.asarray(x))
+def _to_numpy(x):
+    return np.asarray(x)
 
 
 def _all_finite(x) -> bool:
-    x = np.asarray(x)
-    return np.all(np.isfinite(x))
+    arr = np.asarray(x, dtype=float)
+    return np.all(np.isfinite(arr))
 
 
-def _make_sweep_cfg(ab_cfg: MaxDlambdaAblationConfig) -> SweepConfig:
-    """Convert ablation config into the SweepConfig expected by
-    make_model_params from run_architectures.py.
-    """
+def _safe_last(hist):
+    if hist is None:
+        return np.nan
+    arr = np.asarray(hist, dtype=float)
+    if arr.size == 0:
+        return np.nan
+    return float(arr[-1])
+
+
+def _safe_min(hist):
+    if hist is None:
+        return np.nan
+    arr = np.asarray(hist, dtype=float)
+    finite = np.isfinite(arr)
+    if not np.any(finite):
+        return np.nan
+    return float(np.nanmin(arr))
+
+
+def _make_sweep_cfg(cfg: MaxDlambdaAblationConfig, *, seed: int, max_dlambda: float) -> SweepConfig:
+    """Build the exact SweepConfig consumed by run_one_architecture(...)."""
     return SweepConfig(
-        der_K_diag=ab_cfg.der_K_diag,
-        der_K_chol=ab_cfg.der_K_chol,
-        hidden=ab_cfg.hidden,
-        corr_factor=ab_cfg.corr_factor,
-        input_mode=ab_cfg.input_mode,
-        zero_reference=ab_cfg.zero_reference,
-        activation=ab_cfg.activation,
-        n_epochs=ab_cfg.n_epochs,
-        lr=ab_cfg.lr,
-        seed=ab_cfg.seed,
-        output_dir=ab_cfg.output_dir,   # not used directly here
-        save_npz=ab_cfg.save_npz,
-        save_plots=ab_cfg.save_plots,
-        verbose=ab_cfg.verbose,
+        der_K_diag=cfg.der_K_diag,
+        der_K_chol=cfg.der_K_chol,
+        hidden=cfg.hidden,
+        corr_factor=cfg.corr_factor,
+        input_mode=cfg.input_mode,
+        zero_reference=cfg.zero_reference,
+        activation=cfg.activation,
+        n_epochs=cfg.n_epochs,
+        lr=cfg.lr,
+        seed=seed,
+        valid_every=cfg.valid_every,
+        max_dlambda=max_dlambda,
+        iters=cfg.iters,
+        ls_steps=cfg.ls_steps,
+        abs_tol=cfg.abs_tol,
+        rel_tol=cfg.rel_tol,
+        fail_on_nonconvergence=cfg.fail_on_nonconvergence,
+        output_dir=cfg.output_dir,
+        save_npz=cfg.save_npz,
+        save_plots=cfg.save_plots,
+        verbose=cfg.verbose,
+        continue_on_failure=cfg.continue_on_failure,
     )
+
+
+def _record_from_result(
+    result: dict,
+    spec: ArchSpec,
+    seed: int,
+    max_dlambda: float,
+    strict_finite_check: bool,
+) -> dict:
+    train_hist = result.get("train_hist", None)
+    valid_hist = result.get("valid_hist", None)
+
+    train_hist_finite = _all_finite(train_hist) if train_hist is not None else False
+    valid_hist_finite = _all_finite(valid_hist) if valid_hist is not None else False
+
+    success = bool(result.get("success", False))
+    failure_reason = str(result.get("failure_reason", ""))
+
+    # Optional extra strictness, disabled by default so behavior
+    # stays as close as possible to run_architectures.py.
+    if strict_finite_check:
+        if not train_hist_finite:
+            success = False
+            failure_reason = "nonfinite_train_hist"
+        elif not valid_hist_finite:
+            success = False
+            failure_reason = "nonfinite_valid_hist"
+
+    return {
+        "arch_name": spec.name,
+        "model_cls": spec.model_cls.__name__,
+        "which_case": spec.which_case,
+        "seed": int(seed),
+        "max_dlambda": float(max_dlambda),
+        "iters": int(result["cfg"].iters),
+        "ls_steps": int(result["cfg"].ls_steps),
+        "abs_tol": float(result["cfg"].abs_tol),
+        "rel_tol": float(result["cfg"].rel_tol),
+        "fail_on_nonconvergence": bool(result["cfg"].fail_on_nonconvergence),
+        "n_epochs": int(result["cfg"].n_epochs),
+        "lr": float(result["cfg"].lr),
+        "success": bool(success),
+        "failure_reason": failure_reason,
+        "train_hist_finite": bool(train_hist_finite),
+        "valid_hist_finite": bool(valid_hist_finite),
+        "final_train_loss": _safe_last(train_hist),
+        "final_valid_loss": _safe_last(valid_hist),
+        "min_train_loss": _safe_min(train_hist),
+        "min_valid_loss": _safe_min(valid_hist),
+        "exp_dir": result.get("exp_dir", None),
+        "exp_name": result.get("exp_name", None),
+    }
 
 
 def _make_arch_dir(root: str, arch_name: str) -> str:
@@ -102,92 +180,112 @@ def _make_arch_dir(root: str, arch_name: str) -> str:
     return d
 
 
-def _make_run_dir(root: str, arch_name: str, max_dlambda: float) -> str:
-    tag = f"maxdl_{max_dlambda:.3e}".replace("+", "")
-    d = os.path.join(root, arch_name, tag)
+def _make_seed_dir(root: str, arch_name: str, seed: int) -> str:
+    d = os.path.join(root, arch_name, f"seed_{seed}")
     os.makedirs(d, exist_ok=True)
     return d
 
 
-def _check_run_stability(
-    model,
-    train_hist,
-    valid_hist,
-    base,
-    aux,
-    train_data,
-    valid_data,
-    max_dlambda,
-    iters,
-    ls_steps,
-    check_predictions=True,
-):
-    out = {
-        "train_hist_finite": _all_finite(train_hist),
-        "valid_hist_finite": _all_finite(valid_hist),
-        "train_pred_finite": True,
-        "valid_pred_finite": True,
-        "success": False,
-        "failure_reason": "",
-    }
-
-    if not out["train_hist_finite"]:
-        out["failure_reason"] = "nonfinite_train_hist"
-        return out
-
-    if not out["valid_hist_finite"]:
-        out["failure_reason"] = "nonfinite_valid_hist"
-        return out
-
-    if check_predictions:
-        train_pred = predict(
-            model, base, aux,
-            train_data.idx_b, train_data.xb, train_data.lambdas,
-            max_dlambda=max_dlambda,
-            iters=iters,
-            ls_steps=ls_steps,
-        )
-        valid_pred = predict(
-            model, base, aux,
-            valid_data.idx_b, valid_data.xb, valid_data.lambdas,
-            max_dlambda=max_dlambda,
-            iters=iters,
-            ls_steps=ls_steps,
-        )
-
-        out["train_pred_finite"] = _all_finite(train_pred)
-        out["valid_pred_finite"] = _all_finite(valid_pred)
-
-        if not out["train_pred_finite"]:
-            out["failure_reason"] = "nonfinite_train_pred"
-            return out
-        if not out["valid_pred_finite"]:
-            out["failure_reason"] = "nonfinite_valid_pred"
-            return out
-
-    out["success"] = True
-    return out
-
-
+# =========================================================
+# Plots
+# =========================================================
 def plot_architecture_curve(records, arch_name, save_path=None, show=False):
+    if len(records) == 0:
+        return
+
     xs = np.array([r["max_dlambda"] for r in records], dtype=float)
     train_last = np.array([r["final_train_loss"] for r in records], dtype=float)
     valid_last = np.array([r["final_valid_loss"] for r in records], dtype=float)
-    success = np.array([1.0 if r["success"] else 0.0 for r in records], dtype=float)
+    success = np.array([bool(r["success"]) for r in records], dtype=bool)
 
     fig, ax = plt.subplots(figsize=(7.5, 5.0))
-    ax.plot(xs, train_last, marker="o", linewidth=2.0, label="Train final loss")
-    ax.plot(xs, valid_last, marker="s", linewidth=2.0, label="Valid final loss")
 
-    failed = success < 0.5
-    if np.any(failed):
-        ax.scatter(xs[failed], valid_last[failed], marker="x", s=80, label="Failed")
+    ok_train = success & np.isfinite(train_last)
+    ok_valid = success & np.isfinite(valid_last)
+    fail = ~success
+
+    if np.any(ok_train):
+        ax.plot(xs[ok_train], train_last[ok_train], marker="o", linewidth=2.0, label="Train")
+    if np.any(ok_valid):
+        ax.plot(xs[ok_valid], valid_last[ok_valid], marker="s", linewidth=2.0, label="Valid")
+
+    if np.any(fail):
+        finite_pos = np.concatenate([
+            train_last[np.isfinite(train_last) & (train_last > 0)],
+            valid_last[np.isfinite(valid_last) & (valid_last > 0)],
+        ])
+        y_fail = np.min(finite_pos) if finite_pos.size > 0 else 1.0
+        ax.scatter(xs[fail], np.full(np.sum(fail), y_fail), marker="x", s=80, label="Failed")
+
+    ax.set_xscale("log")
+    if np.any(np.isfinite(np.concatenate([train_last, valid_last])) &
+              (np.concatenate([train_last, valid_last]) > 0)):
+        ax.set_yscale("log")
+
+    ax.set_xlabel("max_dlambda")
+    ax.set_ylabel("Final loss")
+    ax.set_title(f"{arch_name}: max_dlambda sweep")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def plot_seed_envelope(records, arch_name, save_path=None, show=False):
+    if len(records) == 0:
+        return
+
+    seeds = sorted(set(int(r["seed"]) for r in records))
+    xs_all = sorted(set(float(r["max_dlambda"]) for r in records))
+
+    fig, ax = plt.subplots(figsize=(7.5, 5.0))
+
+    for seed in seeds:
+        seed_records = [r for r in records if int(r["seed"]) == seed]
+        seed_records = sorted(seed_records, key=lambda r: r["max_dlambda"])
+
+        xs = np.array([r["max_dlambda"] for r in seed_records], dtype=float)
+        ys = np.array([r["final_valid_loss"] for r in seed_records], dtype=float)
+        ok = np.array([bool(r["success"]) for r in seed_records], dtype=bool)
+
+        good = ok & np.isfinite(ys) & (ys > 0)
+        if np.any(good):
+            ax.plot(xs[good], ys[good], marker="o", linewidth=1.5, alpha=0.7, label=f"seed {seed}")
+
+    all_valid = []
+    for x in xs_all:
+        vals = [
+            float(r["final_valid_loss"])
+            for r in records
+            if float(r["max_dlambda"]) == x
+            and bool(r["success"])
+            and np.isfinite(r["final_valid_loss"])
+            and float(r["final_valid_loss"]) > 0
+        ]
+        if len(vals) > 0:
+            all_valid.append((x, np.min(vals), np.median(vals), np.max(vals)))
+
+    if len(all_valid) > 0:
+        xs = np.array([t[0] for t in all_valid], dtype=float)
+        y_min = np.array([t[1] for t in all_valid], dtype=float)
+        y_med = np.array([t[2] for t in all_valid], dtype=float)
+        y_max = np.array([t[3] for t in all_valid], dtype=float)
+
+        ax.fill_between(xs, y_min, y_max, alpha=0.2)
+        ax.plot(xs, y_med, linewidth=3.0, label="median valid")
 
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlabel("max_dlambda")
-    ax.set_ylabel("Final loss")
-    ax.set_title(f"{arch_name}: continuation-step ablation")
+    ax.set_ylabel("Final valid loss")
+    ax.set_title(f"{arch_name}: seed sweep envelope")
     ax.grid(True, alpha=0.25)
     ax.legend()
     fig.tight_layout()
@@ -210,10 +308,12 @@ def plot_success_summary(all_results, save_path=None, show=False):
         records = all_results[arch_name]
         xs = np.array([r["max_dlambda"] for r in records], dtype=float)
         ys = np.full_like(xs, i, dtype=float)
-        ok = np.array([r["success"] for r in records], dtype=bool)
+        ok = np.array([bool(r["success"]) for r in records], dtype=bool)
 
-        ax.scatter(xs[ok], ys[ok], marker="o", s=60)
-        ax.scatter(xs[~ok], ys[~ok], marker="x", s=70)
+        if np.any(ok):
+            ax.scatter(xs[ok], ys[ok], marker="o", s=60)
+        if np.any(~ok):
+            ax.scatter(xs[~ok], ys[~ok], marker="x", s=70)
 
     ax.set_xscale("log")
     ax.set_yticks(np.arange(len(arch_names)))
@@ -246,114 +346,80 @@ def run_one_architecture_max_dlambda_ablation(
     os.makedirs(root_dir, exist_ok=True)
     arch_dir = _make_arch_dir(root_dir, spec.name)
 
-    train_data = Dataset.load(train_file)
-    valid_data = Dataset.load(valid_file)
-    base, aux = get_slinky(properties)
-
-    sweep_cfg = _make_sweep_cfg(cfg)
-
     records = []
-    for max_dlambda in cfg.max_dlambda_values:
-        run_dir = _make_run_dir(root_dir, spec.name, max_dlambda)
 
-        if cfg.verbose:
-            print("=" * 100)
-            print(f"Architecture : {spec.name}")
-            print(f"which_case   : {spec.which_case}")
-            print(f"max_dlambda  : {max_dlambda:.3e}")
-            print(f"iters        : {cfg.iters}")
-            print(f"ls_steps     : {cfg.ls_steps}")
-            print("=" * 100)
+    for seed in cfg.seed_list:
+        seed_dir = _make_seed_dir(root_dir, spec.name, seed)
 
-        params = make_model_params(sweep_cfg, spec)
+        stop_this_seed = False
+        for max_dlambda in cfg.max_dlambda_values:
+            if stop_this_seed:
+                break
 
-        success = False
-        failure_reason = ""
-        train_hist = [np.nan]
-        valid_hist = [np.nan]
+            run_cfg = _make_sweep_cfg(cfg, seed=seed, max_dlambda=max_dlambda)
 
-        try:
-            model, train_hist, valid_hist = train_model(
+            if cfg.verbose:
+                print("=" * 100)
+                print(f"Architecture : {spec.name}")
+                print(f"which_case   : {spec.which_case}")
+                print(f"seed         : {seed}")
+                print(f"max_dlambda  : {max_dlambda:.3e}")
+                print(f"iters        : {run_cfg.iters}")
+                print(f"ls_steps     : {run_cfg.ls_steps}")
+                print(f"abs_tol      : {run_cfg.abs_tol:.3e}")
+                print(f"rel_tol      : {run_cfg.rel_tol:.3e}")
+                print(f"fail_on_nonconvergence : {run_cfg.fail_on_nonconvergence}")
+                print("=" * 100)
+
+            # IMPORTANT:
+            # We call the SAME runner as run_architectures.py.
+            result = run_one_architecture(
                 properties=properties,
-                model_cls=spec.model_cls,
-                params=params,
                 train_file=train_file,
                 valid_file=valid_file,
-                n_epochs=cfg.n_epochs,
-                lr=cfg.lr,
-                valid_every=cfg.valid_every,
+                spec=spec,
+                cfg=run_cfg,
+            )
+
+            rec = _record_from_result(
+                result=result,
+                spec=spec,
+                seed=seed,
                 max_dlambda=max_dlambda,
-                iters=cfg.iters,
-                ls_steps=cfg.ls_steps,
+                strict_finite_check=cfg.strict_finite_check,
             )
+            records.append(rec)
 
-            status = _check_run_stability(
-                model=model,
-                train_hist=train_hist,
-                valid_hist=valid_hist,
-                base=base,
-                aux=aux,
-                train_data=train_data,
-                valid_data=valid_data,
-                max_dlambda=max_dlambda,
-                iters=cfg.iters,
-                ls_steps=cfg.ls_steps,
-                check_predictions=cfg.check_predictions,
-            )
-            success = status["success"]
-            failure_reason = status["failure_reason"]
-
-        except Exception as e:
-            success = False
-            failure_reason = f"exception: {repr(e)}"
-
-        rec = {
-            "arch_name": spec.name,
-            "model_cls": spec.model_cls.__name__,
-            "which_case": spec.which_case,
-            "max_dlambda": float(max_dlambda),
-            "iters": int(cfg.iters),
-            "ls_steps": int(cfg.ls_steps),
-            "success": bool(success),
-            "failure_reason": failure_reason,
-            "final_train_loss": _to_float(train_hist[-1]) if len(train_hist) else np.nan,
-            "final_valid_loss": _to_float(valid_hist[-1]) if len(valid_hist) else np.nan,
-            "min_train_loss": float(np.nanmin(np.asarray(train_hist, dtype=float))),
-            "min_valid_loss": float(np.nanmin(np.asarray(valid_hist, dtype=float))),
-            "n_epochs": int(cfg.n_epochs),
-            "seed": int(cfg.seed),
-        }
-        records.append(rec)
-
-        if cfg.save_json:
-            with open(os.path.join(run_dir, "result.json"), "w") as f:
-                json.dump(rec, f, indent=2)
-
-        if cfg.save_npz:
-            np.savez(
-                os.path.join(run_dir, "histories.npz"),
-                train_hist=np.asarray(train_hist, dtype=float),
-                valid_hist=np.asarray(valid_hist, dtype=float),
-            )
-
-        if cfg.verbose:
-            tag = "SUCCESS" if success else f"FAIL ({failure_reason})"
-            print(
-                f"[{spec.name}] max_dlambda={max_dlambda:.3e} | "
-                f"train={rec['final_train_loss']:.3e} | "
-                f"valid={rec['final_valid_loss']:.3e} | {tag}"
-            )
-
-        if (not success) and cfg.stop_after_first_failure:
             if cfg.verbose:
+                tag = "SUCCESS" if rec["success"] else f"FAIL ({rec['failure_reason']})"
+                train_str = f"{rec['final_train_loss']:.3e}" if np.isfinite(rec["final_train_loss"]) else "nan"
+                valid_str = f"{rec['final_valid_loss']:.3e}" if np.isfinite(rec["final_valid_loss"]) else "nan"
                 print(
-                    f"Stopping larger max_dlambda values for {spec.name} "
-                    f"after first failure."
+                    f"[{spec.name}] seed={seed} | max_dlambda={max_dlambda:.3e} | "
+                    f"train={train_str} | valid={valid_str} | {tag}"
                 )
-            break
 
-    if cfg.save_json:
-        with open(os.path.join(arch_dir, "summary.json"), "w") as f:
+            if (not rec["success"]) and cfg.stop_after_first_failure:
+                stop_this_seed = True
+                if cfg.verbose:
+                    print(f"Stopping larger max_dlambda values for {spec.name}, seed={seed} after first failure.")
+
+        if cfg.save_summary_json:
+            seed_records = [r for r in records if int(r["seed"]) == int(seed)]
+            with open(os.path.join(seed_dir, "summary.json"), "w") as f:
+                json.dump(
+                    {
+                        "arch_name": spec.name,
+                        "seed": int(seed),
+                        "records": seed_records,
+                        "cfg": asdict(cfg),
+                    },
+                    f,
+                    indent=2,
+                )
+
+    if cfg.save_summary_json:
+        with open(os.path.join(arch_dir, "summary_all_seeds.json"), "w") as f:
             json.dump(
                 {
                     "arch_name": spec.name,
@@ -364,13 +430,25 @@ def run_one_architecture_max_dlambda_ablation(
                 indent=2,
             )
 
-    if cfg.save_plots and len(records) > 0:
-        plot_architecture_curve(
-            records,
-            arch_name=spec.name,
-            save_path=os.path.join(arch_dir, "max_dlambda_curve.png"),
-            show=False,
-        )
+    if cfg.save_summary_plots and len(records) > 0:
+        # Per-seed individual curves
+        for seed in sorted(set(int(r["seed"]) for r in records)):
+            seed_records = [r for r in records if int(r["seed"]) == seed]
+            plot_architecture_curve(
+                seed_records,
+                arch_name=f"{spec.name} | seed {seed}",
+                save_path=os.path.join(arch_dir, f"max_dlambda_curve_seed_{seed}.png"),
+                show=False,
+            )
+
+        # Aggregate across seeds
+        if len(set(int(r["seed"]) for r in records)) > 1:
+            plot_seed_envelope(
+                records,
+                arch_name=spec.name,
+                save_path=os.path.join(arch_dir, "max_dlambda_seed_envelope.png"),
+                show=False,
+            )
 
     return records
 
@@ -391,7 +469,7 @@ def run_max_dlambda_ablation(
         arch_names = list(registry.keys())
     else:
         unknown = [name for name in selected_architectures if name not in registry]
-        if unknown:
+        if len(unknown) > 0:
             raise ValueError(f"Unknown architecture names: {unknown}")
         arch_names = selected_architectures
 
@@ -406,14 +484,14 @@ def run_max_dlambda_ablation(
             cfg=cfg,
         )
 
-    if cfg.save_plots:
+    if cfg.save_summary_plots:
         plot_success_summary(
             all_results,
             save_path=os.path.join(cfg.output_dir, "success_summary.png"),
             show=False,
         )
 
-    if cfg.save_json:
+    if cfg.save_summary_json:
         with open(os.path.join(cfg.output_dir, "all_results.json"), "w") as f:
             json.dump(all_results, f, indent=2)
 
@@ -421,22 +499,34 @@ def run_max_dlambda_ablation(
 
 
 # =========================================================
-# Optional helper: best stable max_dlambda per architecture
+# Optional summaries
 # =========================================================
 def summarize_best_stable_step(all_results):
     summary = {}
     for arch_name, records in all_results.items():
-        stable = [r for r in records if r["success"]]
-        if len(stable) == 0:
-            summary[arch_name] = {
-                "largest_stable_max_dlambda": None,
-                "best_valid_loss_among_stable": None,
-            }
-        else:
-            summary[arch_name] = {
-                "largest_stable_max_dlambda": max(r["max_dlambda"] for r in stable),
-                "best_valid_loss_among_stable": min(r["final_valid_loss"] for r in stable),
-            }
+        by_seed = {}
+        seeds = sorted(set(int(r["seed"]) for r in records))
+
+        for seed in seeds:
+            stable = [
+                r for r in records
+                if int(r["seed"]) == seed
+                and bool(r["success"])
+                and np.isfinite(r["final_valid_loss"])
+            ]
+            if len(stable) == 0:
+                by_seed[str(seed)] = {
+                    "largest_stable_max_dlambda": None,
+                    "best_valid_loss_among_stable": None,
+                }
+            else:
+                by_seed[str(seed)] = {
+                    "largest_stable_max_dlambda": max(r["max_dlambda"] for r in stable),
+                    "best_valid_loss_among_stable": min(r["final_valid_loss"] for r in stable),
+                }
+
+        summary[arch_name] = by_seed
+
     return summary
 
 
@@ -444,14 +534,23 @@ def summarize_best_stable_step(all_results):
 # Example main
 # =========================================================
 if __name__ == "__main__":
-    # train_file = "../experiment_data/train_dataset.npz"
-    # valid_file = "../experiment_data/test_dataset.npz"
-
     train_file = "../experiment_data/n5_combined_train_dataset.npz"
     valid_file = "../experiment_data/n5_combined_test_dataset.npz"
 
-    # replace with your actual properties object
-    properties = None
+    from properties import Properties
+
+    properties = Properties(
+        length=0.2,
+        r0=0.005,
+        axs=None,
+        jxs=None,
+        ixs1=None,
+        ixs2=None,
+        density=800.0,
+        E=1e6,
+        N=5,
+        mass=0.3,
+    )
 
     cfg = MaxDlambdaAblationConfig(
         hidden=(10,),
@@ -459,44 +558,40 @@ if __name__ == "__main__":
         input_mode="raw",
         zero_reference=True,
         activation="softplus",
-        seed=0,
-        n_epochs=200,
-        lr=1e-3,
-        iters=20,
-        ls_steps=10,
+
+        # Keep these identical to your run_architectures.py test
+        n_epochs=100,
+        lr=1e-2,
+        seed_list=(0,),
+        valid_every=1,
+
         max_dlambda_values=(1e-2, 5e-2, 1e-1, 5e-1, 1.0),
-        stop_after_first_failure=True,
-        check_predictions=True,
+        iters=5,
+        ls_steps=10,
+        abs_tol=1e-8,
+        rel_tol=1e-6,
+        fail_on_nonconvergence=False,
+
         output_dir="max_dlambda_ablation_outputs",
-        save_json=True,
         save_npz=True,
         save_plots=True,
         verbose=True,
+        continue_on_failure=True,
+
+        stop_after_first_failure=False,
+
+        # Keep False if you want behavior as close as possible
+        # to run_architectures.py.
+        strict_finite_check=False,
+
+        save_summary_json=True,
+        save_summary_plots=True,
     )
 
-    # Example: choose only selected architectures
     selected_architectures = [
         "diag_energy_baseline",
         "chol_stiffness_mlp",
-        # add whatever you want here
     ]
-
-    from properties import Properties
-
-    properties = Properties(
-        length = 0.2,
-        r0 = 0.005,
-        axs = None,
-        jxs = None,
-        ixs1 = None,
-        ixs2 = None,
-        density = 800.0,
-        E = 1e6,
-        N = 5, # 3 or 5
-        # start = jax.numpy.array([0, 0, 0]),
-        # end = jax.numpy.array([0.266166, 0., 0.01240256]),
-        mass = 0.3
-    )
 
     results = run_max_dlambda_ablation(
         properties=properties,
@@ -507,5 +602,5 @@ if __name__ == "__main__":
     )
 
     summary = summarize_best_stable_step(results)
-    print("\nLargest stable max_dlambda by architecture:")
+    print("\nLargest stable max_dlambda by architecture and seed:")
     print(json.dumps(summary, indent=2))

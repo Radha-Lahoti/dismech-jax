@@ -15,7 +15,7 @@ class Dataset(eqx.Module):
     qs: jax.Array        # (n_traj, T, dof)
     xb: jax.Array        # (n_traj, T, n_b)
     idx_b: jax.Array     # (n_b,) or (n_traj, n_b)
-    lambdas: jax.Array   # (n_traj, T)
+    lambdas: jax.Array   # (n_traj, T) or (T,)
     valid: jax.Array     # (n_traj, T)
 
     @staticmethod
@@ -78,6 +78,9 @@ def predict(
     max_dlambda=5e-3,
     iters=5,
     ls_steps=10,
+    abs_tol=1e-8,
+    rel_tol=1e-6,
+    fail_on_nonconvergence=False,
 ):
     n_traj = xb.shape[0]
 
@@ -86,8 +89,12 @@ def predict(
         lam_all = jnp.broadcast_to(lambdas, (n_traj, lambdas.shape[0]))
     else:
         lam_all = lambdas
-        
-    idx_all = jnp.broadcast_to(idx_b, (n_traj, idx_b.shape[0]))
+
+    # handle shared vs per-trajectory idx_b
+    if idx_b.ndim == 1:
+        idx_all = jnp.broadcast_to(idx_b, (n_traj, idx_b.shape[0]))
+    else:
+        idx_all = idx_b
 
     def predict_one(ib, xb_i, lam_i):
         bc = djx.DirectBC(idx_b=ib, xb=xb_i, lambdas=lam_i)
@@ -99,11 +106,13 @@ def predict(
             max_dlambda=max_dlambda,
             iters=iters,
             ls_steps=ls_steps,
+            abs_tol=abs_tol,
+            rel_tol=rel_tol,
+            fail_on_nonconvergence=fail_on_nonconvergence,
         )
 
     pred = jax.vmap(predict_one)(idx_all, xb, lam_all)
     return pred
-
 
 # =========================================================
 # Loss (MSE over trajectories)
@@ -120,6 +129,9 @@ def traj_loss(
     max_dlambda=5e-3,
     iters=5,
     ls_steps=10,
+    abs_tol=1e-8,
+    rel_tol=1e-6,
+    fail_on_nonconvergence=False,
 ):
     bc = djx.DirectBC(idx_b=idx_b, xb=xb, lambdas=lambdas)
     rod = base.with_bc(bc)
@@ -131,6 +143,9 @@ def traj_loss(
         max_dlambda=max_dlambda,
         iters=iters,
         ls_steps=ls_steps,
+        abs_tol=abs_tol,
+        rel_tol=rel_tol,
+        fail_on_nonconvergence=fail_on_nonconvergence,
     )
     err = (qs_pred - qs_true) ** 2
     masked_err = jnp.where(valid[..., None], err, 0.0)
@@ -145,6 +160,9 @@ def dataset_loss(
     max_dlambda=5e-3,
     iters=5,
     ls_steps=10,
+    abs_tol=1e-8,
+    rel_tol=1e-6,
+    fail_on_nonconvergence=False,
 ):
     n_traj = data.qs.shape[0]
 
@@ -154,24 +172,32 @@ def dataset_loss(
     else:
         idx_all = data.idx_b
 
+    # handle shared vs per-trajectory lambdas
+    if data.lambdas.ndim == 1:
+        lam_all = jnp.broadcast_to(data.lambdas, (n_traj, data.lambdas.shape[0]))
+    else:
+        lam_all = data.lambdas
+
     losses = jax.vmap(
-        lambda ib, xb, qs, _lambda, valid: traj_loss(
+        lambda ib, xb, qs, lam, valid: traj_loss(
             model,
             base,
             aux,
             ib,
             xb,
-            _lambda,
+            lam,
             qs,
             valid,
             max_dlambda=max_dlambda,
             iters=iters,
             ls_steps=ls_steps,
+            abs_tol=abs_tol,
+            rel_tol=rel_tol,
+            fail_on_nonconvergence=fail_on_nonconvergence,
         )
-    )(idx_all, data.xb, data.qs, data.lambdas, data.valid)
+    )(idx_all, data.xb, data.qs, lam_all, data.valid)
 
     return jnp.mean(losses)
-
 
 # =========================================================
 # Training
@@ -186,10 +212,15 @@ def train_model(
     lr=1e-2,
     snapshot_fn=None,
     snapshot_every=None,
+    snapshot_epochs=None,
+    snapshot_before_training=False,
     valid_every=1,
     max_dlambda=5e-3,
     iters=5,
     ls_steps=10,
+    abs_tol=1e-8,
+    rel_tol=1e-6,
+    fail_on_nonconvergence=False,
 ):
     # --- setup ---
     base, aux = get_slinky(properties)
@@ -198,24 +229,11 @@ def train_model(
 
     model = model_cls(params)
 
-    schedule = optax.cosine_decay_schedule(
-        init_value=lr,
-        decay_steps=n_epochs + 1,
-        alpha=0.1,
-    )
-
-    # opt = optax.adam(schedule)
-    # Optax: Adam
+    # Optax: AdaBelief
     opt = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adam(learning_rate=lr),
-    ) 
-    # Optax: AdaBelief
-    # opt = optax.chain(
-    #     optax.clip_by_global_norm(1.0),
-    #     optax.adabelief(learning_rate=schedule),
-    # )   
-
+        optax.adabelief(learning_rate=lr),
+    )
 
     opt_state = opt.init(model)
 
@@ -231,6 +249,9 @@ def train_model(
                 max_dlambda=max_dlambda,
                 iters=iters,
                 ls_steps=ls_steps,
+                abs_tol=abs_tol,
+                rel_tol=rel_tol,
+                fail_on_nonconvergence=fail_on_nonconvergence,
             )
         )(model)
 
@@ -243,6 +264,19 @@ def train_model(
     valid_hist = []
 
     last_val_loss = jnp.nan
+    snapshot_epoch_set = None if snapshot_epochs is None else set(snapshot_epochs)
+
+    if snapshot_fn is not None and snapshot_before_training:
+        snapshot_fn(
+            model=model,
+            epoch=-1,
+            base=base,
+            aux=aux,
+            train=train,
+            valid=valid,
+            train_loss=jnp.nan,
+            val_loss=jnp.nan,
+        )
 
     for i in range(n_epochs):
         model, opt_state, train_loss = step(model, opt_state)
@@ -261,28 +295,37 @@ def train_model(
                 max_dlambda=max_dlambda,
                 iters=iters,
                 ls_steps=ls_steps,
+                abs_tol=abs_tol,
+                rel_tol=rel_tol,
+                fail_on_nonconvergence=fail_on_nonconvergence,
             )
 
         valid_hist.append(last_val_loss)
 
-        if i % 10 == 0:
+        if i % 100 == 0:
             print(
                 f"Epoch {i:03d} | Train: {float(train_loss):.3e} | "
                 f"Valid: {float(last_val_loss):.3e}"
             )
 
         # optional snapshot hook
-        if snapshot_fn is not None and snapshot_every is not None:
-            if (i % snapshot_every == 0) or (i == n_epochs - 1):
-                snapshot_fn(
-                    model=model,
-                    epoch=i,
-                    base=base,
-                    aux=aux,
-                    train=train,
-                    valid=valid,
-                    train_loss=train_loss,
-                    val_loss=last_val_loss,
-                )
+        should_snapshot = False
+        if snapshot_fn is not None:
+            if snapshot_every is not None and ((i % snapshot_every == 0) or (i == n_epochs - 1)):
+                should_snapshot = True
+            if snapshot_epoch_set is not None and i in snapshot_epoch_set:
+                should_snapshot = True
+
+        if should_snapshot:
+            snapshot_fn(
+                model=model,
+                epoch=i,
+                base=base,
+                aux=aux,
+                train=train,
+                valid=valid,
+                train_loss=train_loss,
+                val_loss=last_val_loss,
+            )
 
     return model, train_hist, valid_hist

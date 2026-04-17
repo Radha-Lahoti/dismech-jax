@@ -16,3 +16,41 @@ class Properties:
     start: jax.Array | None = None
     end: jax.Array | None = None
     mass: float | None = None
+
+
+## =========================================================
+# DLO properties
+# =========================================================
+@dataclass
+class SlinkyN3Properties(Properties):
+    length: float = 0.20
+    r0: float = 0.005
+    density: float = 1200.0
+    E: float = 1e6
+    N: int = 3
+    mass: float = 0.3
+
+@dataclass
+class SlinkyN5Properties(Properties):
+    length: float = 0.20
+    r0: float = 0.005
+    density: float = 1200.0
+    E: float = 1e6
+    N: int = 5
+    mass: float = 0.3
+
+@dataclass
+class StripN9Properties(Properties):
+    length: float = 0.55
+    r0: float = 0.005
+    density: float = 700.0
+    E: float = 1e6
+    N: int = 9
+
+@dataclass
+class TubeN7Properties(Properties):
+    length: float = 0.45
+    r0: float = 0.005
+    density: float = 700.0
+    E: float = 1e6
+    N: int = 7

@@ -328,8 +328,16 @@ class Rod(System[TripletState]):
         ls_steps: int = 10,
         c1: float = 1e-4,
         max_dlambda: float = 1e-1,
+        abs_tol: float = 1e-8,
+        rel_tol: float = 1e-6,
+        fail_on_nonconvergence: bool = False,
     ) -> jax.Array:
-        args = (model, lambdas, self.q0, aux, self, iters, ls_steps, c1, max_dlambda)
+        args = (
+            model, lambdas, self.q0, aux, self,
+            iters, ls_steps, c1, max_dlambda,
+            abs_tol, rel_tol, fail_on_nonconvergence
+        )
+
         if not self.is_batched(self.in_axes):
             return solve(*args)
 
@@ -338,8 +346,15 @@ class Rod(System[TripletState]):
 
         return eqx.filter_vmap(
             solve,
-            in_axes=(None, None, 0, None, self.in_axes, None, None, None, None),
-        )(model, lambdas, q0, aux, self, iters, ls_steps, c1, max_dlambda)
+            in_axes=(
+                None, None, 0, None, self.in_axes,
+                None, None, None, None, None, None, None
+            ),
+        )(
+            model, lambdas, q0, aux, self,
+            iters, ls_steps, c1, max_dlambda,
+            abs_tol, rel_tol, fail_on_nonconvergence
+        )
 
     @staticmethod
     def _global_q_to_batch_q(q: jax.Array) -> jax.Array:
@@ -366,7 +381,7 @@ class Rod(System[TripletState]):
         dm_edges = l_ks * A * material.density * factor
         edge_indices = jnp.arange(N - 1) * 4 + 3
         mass = mass.at[edge_indices].set(dm_edges)
-        print("total mass:", jnp.sum(mass))
+        # print("total mass:", jnp.sum(mass))
         return mass
 
     @property
@@ -394,8 +409,15 @@ class Rod(System[TripletState]):
         ls_steps: int = 10,
         c1: float = 1e-4,
         max_dlambda: float = 1e-1,
+        abs_tol: float = 1e-8,
+        rel_tol: float = 1e-6,
+        fail_on_nonconvergence: bool = False,
     ):
-        args = (model, lambdas, self.q0, aux, self, iters, ls_steps, c1, max_dlambda)
+        args = (
+            model, lambdas, self.q0, aux, self,
+            iters, ls_steps, c1, max_dlambda,
+            abs_tol, rel_tol, fail_on_nonconvergence
+        )
 
         if not self.is_batched(self.in_axes):
             return solve_with_aux(*args)
@@ -405,8 +427,15 @@ class Rod(System[TripletState]):
 
         return eqx.filter_vmap(
             solve_with_aux,
-            in_axes=(None, None, 0, None, self.in_axes, None, None, None, None),
-        )(model, lambdas, q0, aux, self, iters, ls_steps, c1, max_dlambda)
+            in_axes=(
+                None, None, 0, None, self.in_axes,
+                None, None, None, None, None, None, None
+            ),
+        )(
+            model, lambdas, q0, aux, self,
+            iters, ls_steps, c1, max_dlambda,
+            abs_tol, rel_tol, fail_on_nonconvergence
+        )
 
     def get_del_strain_history(
         self,
@@ -435,3 +464,73 @@ class Rod(System[TripletState]):
             return jax.vmap(self.get_del_strain_history)(qs, auxs)
 
         return jax.vmap(self.get_del_strains)(qs, auxs)
+    
+
+
+
+    # #### Solver with info (residual norms, convergence flags, etc.) ####
+    # @eqx.filter_jit
+    # def solve_with_info(
+    #     self,
+    #     model: eqx.Module,
+    #     lambdas: jax.Array,
+    #     aux: TripletState,
+    #     iters: int = 10,
+    #     ls_steps: int = 10,
+    #     c1: float = 1e-4,
+    #     max_dlambda: float = 1e-1,
+    #     abs_tol: float = 1e-8,
+    #     rel_tol: float = 1e-6,
+    #     fail_on_nonconvergence: bool = False,
+    # ):
+    #     args = (
+    #         model,
+    #         lambdas,
+    #         self.q0,
+    #         aux,
+    #         self,
+    #         iters,
+    #         ls_steps,
+    #         c1,
+    #         max_dlambda,
+    #         abs_tol,
+    #         rel_tol,
+    #         fail_on_nonconvergence,
+    #     )
+
+    #     if not self.is_batched(self.in_axes):
+    #         return solve_with_info(*args)
+
+    #     batch_size = self._infer_batch_size()
+    #     q0 = self._broadcast_q0_for_batch(batch_size)
+
+    #     return eqx.filter_vmap(
+    #         solve_with_info,
+    #         in_axes=(
+    #             None,   # model
+    #             None,   # lambdas
+    #             0,      # q0
+    #             None,   # aux
+    #             self.in_axes,
+    #             None,   # iters
+    #             None,   # ls_steps
+    #             None,   # c1
+    #             None,   # max_dlambda
+    #             None,   # abs_tol
+    #             None,   # rel_tol
+    #             None,   # fail_on_nonconvergence
+    #         ),
+    #     )(
+    #         model,
+    #         lambdas,
+    #         q0,
+    #         aux,
+    #         self,
+    #         iters,
+    #         ls_steps,
+    #         c1,
+    #         max_dlambda,
+    #         abs_tol,
+    #         rel_tol,
+    #         fail_on_nonconvergence,
+    #     )

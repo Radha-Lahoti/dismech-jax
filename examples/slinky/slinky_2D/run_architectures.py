@@ -1,6 +1,6 @@
 import os
 import json
-from dataclasses import dataclass, replace, asdict
+from dataclasses import dataclass, replace, asdict, field
 from typing import Optional
 
 import numpy as np
@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 
 from util import Dataset, get_slinky, predict, train_model
+from util_energy_plots import EnergyLandscapeSpec, make_energy_snapshot_fn
 from Energy_NN_architectures import (
     ModelParams,
     DiagonalPlusEnergyNN,
@@ -111,8 +112,8 @@ def build_architecture_registry() -> dict[str, ArchSpec]:
 class SweepConfig:
     # Separate initializations because diagonal and Cholesky
     # models expect different der_K shapes.
-    der_K_diag: tuple[float, float] = (0.1, 0.1)
-    der_K_chol: tuple[float, float, float] = (0.1, 0.0, 0.1)
+    der_K_diag: tuple[float, float] = (0.2, 0.01)
+    der_K_chol: tuple[float, float, float] = (0.2, 0.0, 0.01)
 
     hidden: tuple[int, ...] = (10,)
     corr_factor: float = 1.0
@@ -123,11 +124,39 @@ class SweepConfig:
     lr: float = 1e-2
     seed: int = 0
 
+    # solver / training-loop compatibility with new util.py
+    valid_every: int = 1
+    max_dlambda: float = 1e-2
+    iters: int = 5
+    ls_steps: int = 10
+    abs_tol: float = 1e-8
+    rel_tol: float = 1e-6
+    fail_on_nonconvergence: bool = False
+
     output_dir: str = "arch_sweep_outputs"
     save_npz: bool = True
     save_plots: bool = True
     verbose: bool = True
     seed_list: tuple[int, ...] = (0, 1, 2, 3, 4)
+
+    # whether sweep should continue if one architecture fails
+    continue_on_failure: bool = True
+
+    # -------------------------
+    # Energy-landscape snapshots
+    # -------------------------
+    save_energy_landscapes: bool = True
+    energy_snapshot_initial: bool = True
+    energy_snapshot_final: bool = True
+    energy_snapshot_epochs: tuple[int, ...] = ()
+    energy_snapshot_every: Optional[int] = None
+    energy_snapshot_use_valid: bool = True
+    energy_snapshot_dpi: int = 180
+    energy_snapshot_n_grid: Optional[int] = None
+    energy_snapshot_dirname: str = "energy_landscapes"
+    energy_landscape_spec: EnergyLandscapeSpec = field(
+        default_factory=EnergyLandscapeSpec
+    )
 
 
 # =========================================================
@@ -180,6 +209,8 @@ def experiment_name(spec: ArchSpec, cfg: SweepConfig) -> str:
         f"__corr_{cfg.corr_factor:g}"
         f"__{zr}"
         f"__seed_{cfg.seed}"
+        f"__mdl_{cfg.max_dlambda:g}"
+        f"__it_{cfg.iters}"
     )
 
 
@@ -187,6 +218,55 @@ def make_experiment_dir(spec: ArchSpec, cfg: SweepConfig) -> str:
     exp_dir = os.path.join(cfg.output_dir, experiment_name(spec, cfg))
     os.makedirs(exp_dir, exist_ok=True)
     return exp_dir
+
+
+def _classify_exception_message(msg: str) -> str:
+    msg_low = msg.lower()
+    if "did not converge" in msg_low or "nonconverge" in msg_low or "converge" in msg_low:
+        return "convergence_failure"
+    if "nan" in msg_low:
+        return "nan_exception"
+    if "inf" in msg_low:
+        return "inf_exception"
+    return f"exception: {msg}"
+
+
+def _build_energy_snapshot_controls(cfg: SweepConfig, exp_dir: str):
+    """
+    Build the snapshot callback + schedule knobs for train_model.
+
+    Default behavior:
+      - initial landscape before training
+      - final landscape after last epoch
+
+    Optional extras:
+      - any explicit epoch numbers in energy_snapshot_epochs
+      - periodic snapshots via energy_snapshot_every
+    """
+    if not (cfg.save_plots and cfg.save_energy_landscapes):
+        return None, None, None
+
+    snapshot_dir = os.path.join(exp_dir, cfg.energy_snapshot_dirname)
+    os.makedirs(snapshot_dir, exist_ok=True)
+
+    snapshot_fn = make_energy_snapshot_fn(
+        spec=cfg.energy_landscape_spec,
+        save_dir=snapshot_dir,
+        use_valid=cfg.energy_snapshot_use_valid,
+        traj_idx=cfg.energy_landscape_spec.traj_idx,
+        max_dlambda=cfg.max_dlambda,
+        iters=cfg.iters,
+        ls_steps=cfg.ls_steps,
+        dpi=cfg.energy_snapshot_dpi,
+        n_grid_snapshot=cfg.energy_snapshot_n_grid,
+    )
+
+    epoch_list = list(cfg.energy_snapshot_epochs)
+    if cfg.energy_snapshot_final and cfg.n_epochs > 0:
+        epoch_list.append(cfg.n_epochs - 1)
+    snapshot_epochs = tuple(sorted(set(epoch_list))) if len(epoch_list) > 0 else None
+
+    return snapshot_fn, snapshot_epochs, cfg.energy_snapshot_initial
 
 
 # =========================================================
@@ -396,6 +476,12 @@ def save_results_npz(
         seed=cfg.seed,
         der_K_diag=np.asarray(cfg.der_K_diag, dtype=float),
         der_K_chol=np.asarray(cfg.der_K_chol, dtype=float),
+        max_dlambda=float(cfg.max_dlambda),
+        iters=int(cfg.iters),
+        ls_steps=int(cfg.ls_steps),
+        abs_tol=float(cfg.abs_tol),
+        rel_tol=float(cfg.rel_tol),
+        fail_on_nonconvergence=int(cfg.fail_on_nonconvergence),
         train_hist=np.asarray(train_hist, dtype=float),
         valid_hist=np.asarray(valid_hist, dtype=float),
         train_pred=np.asarray(train_pred, dtype=float),
@@ -422,131 +508,212 @@ def run_one_architecture(
     if cfg.verbose:
         print("=" * 90)
         print(f"Running architecture: {spec.name}")
-        print(f"  model_cls      : {spec.model_cls.__name__}")
-        print(f"  which_case     : {spec.which_case}")
-        print(f"  hidden         : {cfg.hidden}")
-        print(f"  input_mode     : {cfg.input_mode}")
-        print(f"  activation     : {cfg.activation}")
-        print(f"  corr_factor    : {cfg.corr_factor}")
-        print(f"  zero_reference : {cfg.zero_reference}")
-        print(f"  seed           : {cfg.seed}")
-        print(f"  exp_dir        : {exp_dir}")
+        print(f"  model_cls               : {spec.model_cls.__name__}")
+        print(f"  which_case              : {spec.which_case}")
+        print(f"  hidden                  : {cfg.hidden}")
+        print(f"  input_mode              : {cfg.input_mode}")
+        print(f"  activation              : {cfg.activation}")
+        print(f"  corr_factor             : {cfg.corr_factor}")
+        print(f"  zero_reference          : {cfg.zero_reference}")
+        print(f"  seed                    : {cfg.seed}")
+        print(f"  max_dlambda             : {cfg.max_dlambda}")
+        print(f"  iters                   : {cfg.iters}")
+        print(f"  ls_steps                : {cfg.ls_steps}")
+        print(f"  abs_tol                 : {cfg.abs_tol}")
+        print(f"  rel_tol                 : {cfg.rel_tol}")
+        print(f"  fail_on_nonconvergence  : {cfg.fail_on_nonconvergence}")
+        print(f"  exp_dir                 : {exp_dir}")
+        if cfg.save_energy_landscapes:
+            print(f"  energy snapshots        : initial={cfg.energy_snapshot_initial}, final={cfg.energy_snapshot_final}, epochs={cfg.energy_snapshot_epochs}, every={cfg.energy_snapshot_every}")
+            print(f"  energy snapshot split   : {'valid' if cfg.energy_snapshot_use_valid else 'train'}")
         print("=" * 90)
 
     params = make_model_params(cfg, spec)
-
-    # -------------------------
-    # Train
-    # -------------------------
-    model, train_hist, valid_hist = train_model(
-        properties=properties,
-        model_cls=spec.model_cls,
-        params=params,
-        train_file=train_file,
-        valid_file=valid_file,
-        n_epochs=cfg.n_epochs,
-        lr=cfg.lr,
+    snapshot_fn, snapshot_epochs, snapshot_before_training = _build_energy_snapshot_controls(
+        cfg, exp_dir
     )
 
-    # -------------------------
-    # Predict
-    # -------------------------
-    base, aux = get_slinky(properties)
-    train_data = Dataset.load(train_file)
-    valid_data = Dataset.load(valid_file)
-
-    train_pred = predict(model, base, aux, train_data.idx_b, train_data.xb, train_data.lambdas)
-    valid_pred = predict(model, base, aux, valid_data.idx_b, valid_data.xb, valid_data.lambdas)
-
-    # -------------------------
-    # Save config / arrays
-    # -------------------------
-    save_config_json(cfg, spec, exp_dir)
-
-    if cfg.save_npz:
-        save_results_npz(
-            exp_dir=exp_dir,
-            spec=spec,
-            cfg=cfg,
-            train_hist=train_hist,
-            valid_hist=valid_hist,
-            train_pred=train_pred,
-            valid_pred=valid_pred,
-            train_truth=train_data.qs,
-            valid_truth=valid_data.qs,
-            train_lambdas=train_data.lambdas,
-            valid_lambdas=valid_data.lambdas,
+    try:
+        # -------------------------
+        # Train
+        # -------------------------
+        model, train_hist, valid_hist = train_model(
+            properties=properties,
+            model_cls=spec.model_cls,
+            params=params,
+            train_file=train_file,
+            valid_file=valid_file,
+            n_epochs=cfg.n_epochs,
+            lr=cfg.lr,
+            snapshot_fn=snapshot_fn,
+            snapshot_every=cfg.energy_snapshot_every,
+            snapshot_epochs=snapshot_epochs,
+            snapshot_before_training=snapshot_before_training,
+            valid_every=cfg.valid_every,
+            max_dlambda=cfg.max_dlambda,
+            iters=cfg.iters,
+            ls_steps=cfg.ls_steps,
+            abs_tol=cfg.abs_tol,
+            rel_tol=cfg.rel_tol,
+            fail_on_nonconvergence=cfg.fail_on_nonconvergence,
         )
 
-    # -------------------------
-    # Plots
-    # -------------------------
-    if cfg.save_plots:
-        title = experiment_name(spec, cfg)
+        # -------------------------
+        # Predict
+        # -------------------------
+        base, aux = get_slinky(properties)
+        train_data = Dataset.load(train_file)
+        valid_data = Dataset.load(valid_file)
 
-        plot_loss_curves(
-            train_hist=train_hist,
-            valid_hist=valid_hist,
-            title=title,
-            save_path=os.path.join(exp_dir, "loss_curves.png"),
-            show=False,
-            logy=True,
+        train_pred = predict(
+            model, base, aux,
+            train_data.idx_b, train_data.xb, train_data.lambdas,
+            max_dlambda=cfg.max_dlambda,
+            iters=cfg.iters,
+            ls_steps=cfg.ls_steps,
+            abs_tol=cfg.abs_tol,
+            rel_tol=cfg.rel_tol,
+            fail_on_nonconvergence=cfg.fail_on_nonconvergence,
+        )
+        valid_pred = predict(
+            model, base, aux,
+            valid_data.idx_b, valid_data.xb, valid_data.lambdas,
+            max_dlambda=cfg.max_dlambda,
+            iters=cfg.iters,
+            ls_steps=cfg.ls_steps,
+            abs_tol=cfg.abs_tol,
+            rel_tol=cfg.rel_tol,
+            fail_on_nonconvergence=cfg.fail_on_nonconvergence,
         )
 
-        plot_prediction_vs_truth(
-            pred=train_pred,
-            truth=train_data.qs,
-            split_name="train",
-            title=title,
-            save_path=os.path.join(exp_dir, "pred_vs_truth_train_overlay.png"),
-            show=False,
-        )
+        # -------------------------
+        # Save config / arrays
+        # -------------------------
+        save_config_json(cfg, spec, exp_dir)
 
-        plot_prediction_vs_truth(
-            pred=valid_pred,
-            truth=valid_data.qs,
-            split_name="valid",
-            title=title,
-            save_path=os.path.join(exp_dir, "pred_vs_truth_valid_overlay.png"),
-            show=False,
-        )
+        if cfg.save_npz:
+            save_results_npz(
+                exp_dir=exp_dir,
+                spec=spec,
+                cfg=cfg,
+                train_hist=train_hist,
+                valid_hist=valid_hist,
+                train_pred=train_pred,
+                valid_pred=valid_pred,
+                train_truth=train_data.qs,
+                valid_truth=valid_data.qs,
+                train_lambdas=train_data.lambdas,
+                valid_lambdas=valid_data.lambdas,
+            )
 
-        plot_prediction_vs_truth_separate_components(
-            pred=train_pred,
-            truth=train_data.qs,
-            split_name="train",
-            title=title,
-            save_path=os.path.join(exp_dir, "pred_vs_truth_train_xz.png"),
-            show=False,
-        )
+        # -------------------------
+        # Plots
+        # -------------------------
+        if cfg.save_plots:
+            title = experiment_name(spec, cfg)
 
-        plot_prediction_vs_truth_separate_components(
-            pred=valid_pred,
-            truth=valid_data.qs,
-            split_name="valid",
-            title=title,
-            save_path=os.path.join(exp_dir, "pred_vs_truth_valid_xz.png"),
-            show=False,
-        )
+            plot_loss_curves(
+                train_hist=train_hist,
+                valid_hist=valid_hist,
+                title=title,
+                save_path=os.path.join(exp_dir, "loss_curves.png"),
+                show=False,
+                logy=True,
+            )
 
-    result = {
-        "spec": spec,
-        "cfg": cfg,
-        "params": params,
-        "model": model,
-        "train_hist": np.asarray(train_hist, dtype=float),
-        "valid_hist": np.asarray(valid_hist, dtype=float),
-        "train_pred": np.asarray(train_pred, dtype=float),
-        "valid_pred": np.asarray(valid_pred, dtype=float),
-        "train_truth": np.asarray(train_data.qs),
-        "valid_truth": np.asarray(valid_data.qs),
-        "train_lambdas": np.asarray(train_data.lambdas),
-        "valid_lambdas": np.asarray(valid_data.lambdas),
-        "exp_dir": exp_dir,
-        "exp_name": experiment_name(spec, cfg),
-    }
+            plot_prediction_vs_truth(
+                pred=train_pred,
+                truth=train_data.qs,
+                split_name="train",
+                title=title,
+                save_path=os.path.join(exp_dir, "pred_vs_truth_train_overlay.png"),
+                show=False,
+            )
 
-    return result
+            plot_prediction_vs_truth(
+                pred=valid_pred,
+                truth=valid_data.qs,
+                split_name="valid",
+                title=title,
+                save_path=os.path.join(exp_dir, "pred_vs_truth_valid_overlay.png"),
+                show=False,
+            )
+
+            plot_prediction_vs_truth_separate_components(
+                pred=train_pred,
+                truth=train_data.qs,
+                split_name="train",
+                title=title,
+                save_path=os.path.join(exp_dir, "pred_vs_truth_train_xz.png"),
+                show=False,
+            )
+
+            plot_prediction_vs_truth_separate_components(
+                pred=valid_pred,
+                truth=valid_data.qs,
+                split_name="valid",
+                title=title,
+                save_path=os.path.join(exp_dir, "pred_vs_truth_valid_xz.png"),
+                show=False,
+            )
+
+        result = {
+            "spec": spec,
+            "cfg": cfg,
+            "params": params,
+            "model": model,
+            "train_hist": np.asarray(train_hist, dtype=float),
+            "valid_hist": np.asarray(valid_hist, dtype=float),
+            "train_pred": np.asarray(train_pred, dtype=float),
+            "valid_pred": np.asarray(valid_pred, dtype=float),
+            "train_truth": np.asarray(train_data.qs),
+            "valid_truth": np.asarray(valid_data.qs),
+            "train_lambdas": np.asarray(train_data.lambdas),
+            "valid_lambdas": np.asarray(valid_data.lambdas),
+            "exp_dir": exp_dir,
+            "exp_name": experiment_name(spec, cfg),
+            "success": True,
+            "failure_reason": "",
+        }
+        return result
+
+    except Exception as e:
+        failure_reason = _classify_exception_message(repr(e))
+
+        # still save minimal config + failure record
+        save_config_json(cfg, spec, exp_dir)
+        failure_payload = {
+            "arch_name": spec.name,
+            "model_cls": spec.model_cls.__name__,
+            "which_case": spec.which_case,
+            "success": False,
+            "failure_reason": failure_reason,
+        }
+        with open(os.path.join(exp_dir, "failure.json"), "w") as f:
+            json.dump(failure_payload, f, indent=2)
+
+        if cfg.verbose:
+            print(f"[FAILED] {spec.name}: {failure_reason}")
+
+        result = {
+            "spec": spec,
+            "cfg": cfg,
+            "params": params,
+            "model": None,
+            "train_hist": np.array([np.nan]),
+            "valid_hist": np.array([np.nan]),
+            "train_pred": None,
+            "valid_pred": None,
+            "train_truth": None,
+            "valid_truth": None,
+            "train_lambdas": None,
+            "valid_lambdas": None,
+            "exp_dir": exp_dir,
+            "exp_name": experiment_name(spec, cfg),
+            "success": False,
+            "failure_reason": failure_reason,
+        }
+        return result
 
 
 # =========================================================
@@ -572,13 +739,40 @@ def run_architecture_sweep(
     results = {}
     for arch_name in arch_names:
         spec = registry[arch_name]
-        results[arch_name] = run_one_architecture(
-            properties=properties,
-            train_file=train_file,
-            valid_file=valid_file,
-            spec=spec,
-            cfg=cfg,
-        )
+        try:
+            results[arch_name] = run_one_architecture(
+                properties=properties,
+                train_file=train_file,
+                valid_file=valid_file,
+                spec=spec,
+                cfg=cfg,
+            )
+        except Exception as e:
+            # extra guard, though run_one_architecture already catches failures
+            failure_reason = _classify_exception_message(repr(e))
+            if cfg.verbose:
+                print(f"[SWEEP FAILED] {arch_name}: {failure_reason}")
+
+            results[arch_name] = {
+                "spec": spec,
+                "cfg": cfg,
+                "params": None,
+                "model": None,
+                "train_hist": np.array([np.nan]),
+                "valid_hist": np.array([np.nan]),
+                "train_pred": None,
+                "valid_pred": None,
+                "train_truth": None,
+                "valid_truth": None,
+                "train_lambdas": None,
+                "valid_lambdas": None,
+                "exp_dir": None,
+                "exp_name": None,
+                "success": False,
+                "failure_reason": failure_reason,
+            }
+            if not cfg.continue_on_failure:
+                raise
 
     return results
 
@@ -681,8 +875,15 @@ def run_flag_grid(
 # =========================================================
 def plot_summary_final_losses(results: dict, save_path: Optional[str] = None, show: bool = False):
     names = list(results.keys())
-    train_last = [results[k]["train_hist"][-1] for k in names]
-    valid_last = [results[k]["valid_hist"][-1] for k in names]
+    train_last = []
+    valid_last = []
+
+    for k in names:
+        r = results[k]
+        train_hist = np.asarray(r["train_hist"], dtype=float)
+        valid_hist = np.asarray(r["valid_hist"], dtype=float)
+        train_last.append(train_hist[-1])
+        valid_last.append(valid_hist[-1])
 
     x = np.arange(len(names))
     width = 0.38
@@ -707,61 +908,3 @@ def plot_summary_final_losses(results: dict, save_path: Optional[str] = None, sh
         plt.show()
     else:
         plt.close(fig)
-
-
-# =========================================================
-# 11) Example main
-# =========================================================
-if __name__ == "__main__":
-    # -----------------------------------------------------
-    # Fill these in
-    # -----------------------------------------------------
-    train_file = "train.npz"
-    valid_file = "valid.npz"
-
-    # Replace with your actual properties object
-    properties = None
-
-    cfg = SweepConfig(
-        der_K_diag=(0.1, 0.1),
-        der_K_chol=(0.1, 0.0, 0.1),
-        hidden=(10, 10),
-        corr_factor=1.0,
-        input_mode="raw",
-        zero_reference=True,
-        activation="softplus",
-        n_epochs=200,
-        lr=1e-2,
-        seed=0,
-        output_dir="arch_sweep_outputs",
-        save_npz=True,
-        save_plots=True,
-        verbose=True,
-    )
-
-    # Example: run all 12 architectures
-    # results = run_architecture_sweep(
-    #     properties=properties,
-    #     train_file=train_file,
-    #     valid_file=valid_file,
-    #     cfg=cfg,
-    #     selected_architectures=None,
-    # )
-
-    # Example: run only the main paper subset
-    # results = run_architecture_sweep(
-    #     properties=properties,
-    #     train_file=train_file,
-    #     valid_file=valid_file,
-    #     cfg=cfg,
-    #     selected_architectures=subset_main_paper_candidates(),
-    # )
-
-    # Example: make a summary plot after running
-    # plot_summary_final_losses(
-    #     results,
-    #     save_path=os.path.join(cfg.output_dir, "summary_final_losses.png"),
-    #     show=False,
-    # )
-
-    pass
