@@ -4,14 +4,16 @@ from dataclasses import dataclass, replace, asdict, field
 from typing import Optional
 
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-import matplotlib.lines as mlines
 
 import jax
 import jax.numpy as jnp
 
 from util import Dataset, get_slinky, predict, train_model
+from architecture_plots import (
+    plot_loss_curves,
+    plot_prediction_vs_truth,
+    plot_prediction_vs_truth_separate_components,
+)
 from util_energy_plots import EnergyLandscapeSpec, make_energy_snapshot_fn
 from Energy_NN_architectures import (
     ModelParams,
@@ -289,175 +291,7 @@ def _build_energy_snapshot_controls(cfg: SweepConfig, exp_dir: str):
 
 
 # =========================================================
-# 4) Plotting utilities
-# =========================================================
-def _to_numpy(x):
-    return np.asarray(x)
-
-
-def plot_loss_curves(
-    train_hist,
-    valid_hist,
-    title: str,
-    save_path: Optional[str] = None,
-    show: bool = False,
-    logy: bool = True,
-):
-    train_hist = _to_numpy(train_hist)
-    valid_hist = _to_numpy(valid_hist)
-
-    fig, ax = plt.subplots(figsize=(7.5, 5.0))
-    ax.plot(train_hist, linewidth=2.0, label="Train")
-    ax.plot(valid_hist, linewidth=2.0, label="Valid")
-
-    if logy:
-        ax.set_yscale("log")
-
-    ax.set_title(title)
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("MSE loss")
-    ax.legend()
-    ax.grid(True, alpha=0.25)
-    fig.tight_layout()
-
-    if save_path is not None:
-        fig.savefig(save_path, dpi=300, bbox_inches="tight")
-
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
-
-
-def plot_prediction_vs_truth(
-    pred,
-    truth,
-    split_name: str,
-    title: str,
-    save_path: Optional[str] = None,
-    show: bool = False,
-    x_idx: int = 4,
-    z_idx: int = 6,
-):
-    """
-    Overlays prediction vs truth for all trajectories in one plot.
-
-    For each case:
-      - x DOF is plotted with full opacity
-      - z DOF is plotted with lower opacity
-      - solid = prediction
-      - dashed = truth
-    """
-    pred = _to_numpy(pred)
-    truth = _to_numpy(truth)
-
-    n_cases = pred.shape[0]
-    colors = cm.viridis(np.linspace(0, 1, n_cases))
-
-    fig, ax = plt.subplots(figsize=(8.5, 5.5))
-
-    for i in range(n_cases):
-        c = colors[i]
-
-        # x component
-        ax.plot(pred[i, :, x_idx], color=c, linestyle="-", linewidth=1.8)
-        ax.plot(truth[i, :, x_idx], color=c, linestyle="--", linewidth=1.8)
-
-        # z component
-        ax.plot(pred[i, :, z_idx], color=c, linestyle="-", linewidth=1.4, alpha=0.6)
-        ax.plot(truth[i, :, z_idx], color=c, linestyle="--", linewidth=1.4, alpha=0.6)
-
-    pred_line = mlines.Line2D([], [], color="black", linestyle="-", label="Prediction")
-    truth_line = mlines.Line2D([], [], color="black", linestyle="--", label="Truth")
-    ax.legend(handles=[pred_line, truth_line], loc="best")
-
-    sm = plt.cm.ScalarMappable(
-        cmap="viridis",
-        norm=plt.Normalize(vmin=0, vmax=max(n_cases - 1, 1)),
-    )
-    sm.set_array([])
-    fig.colorbar(sm, ax=ax, label="Case index")
-
-    ax.set_title(f"{title} | {split_name}")
-    ax.set_xlabel("lambda index")
-    ax.set_ylabel("Position (m)")
-    ax.grid(True, alpha=0.2)
-    fig.tight_layout()
-
-    if save_path is not None:
-        fig.savefig(save_path, dpi=300, bbox_inches="tight")
-
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
-
-
-def plot_prediction_vs_truth_separate_components(
-    pred,
-    truth,
-    split_name: str,
-    title: str,
-    save_path: Optional[str] = None,
-    show: bool = False,
-    x_idx: int = 4,
-    z_idx: int = 6,
-):
-    """
-    Cleaner 1x2 figure:
-      - left: x trajectories
-      - right: z trajectories
-    """
-    pred = _to_numpy(pred)
-    truth = _to_numpy(truth)
-
-    n_cases = pred.shape[0]
-    colors = cm.viridis(np.linspace(0, 1, n_cases))
-
-    fig, axes = plt.subplots(1, 2, figsize=(12.0, 4.8))
-    ax1, ax2 = axes
-
-    for i in range(n_cases):
-        c = colors[i]
-        ax1.plot(pred[i, :, x_idx], color=c, linestyle="-", linewidth=1.8)
-        ax1.plot(truth[i, :, x_idx], color=c, linestyle="--", linewidth=1.8)
-
-        ax2.plot(pred[i, :, z_idx], color=c, linestyle="-", linewidth=1.8)
-        ax2.plot(truth[i, :, z_idx], color=c, linestyle="--", linewidth=1.8)
-
-    pred_line = mlines.Line2D([], [], color="black", linestyle="-", label="Prediction")
-    truth_line = mlines.Line2D([], [], color="black", linestyle="--", label="Truth")
-    fig.legend(handles=[pred_line, truth_line], loc="upper center", ncol=2)
-
-    sm = plt.cm.ScalarMappable(
-        cmap="viridis",
-        norm=plt.Normalize(vmin=0, vmax=max(n_cases - 1, 1)),
-    )
-    sm.set_array([])
-    fig.colorbar(sm, ax=axes.ravel().tolist(), label="Case index")
-
-    ax1.set_title("x component")
-    ax2.set_title("z component")
-
-    for ax in axes:
-        ax.set_xlabel("lambda index")
-        ax.set_ylabel("Position (m)")
-        ax.grid(True, alpha=0.2)
-
-    fig.suptitle(f"{title} | {split_name}", y=1.02)
-    fig.tight_layout()
-
-    if save_path is not None:
-        fig.savefig(save_path, dpi=300, bbox_inches="tight")
-
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
-
-
-# =========================================================
-# 5) Saving helpers
+# 4) Saving helpers
 # =========================================================
 def save_config_json(cfg: SweepConfig, spec: ArchSpec, exp_dir: str):
     payload = asdict(cfg)
@@ -481,6 +315,8 @@ def save_results_npz(
     valid_truth,
     train_lambdas,
     valid_lambdas,
+    train_valid_mask,
+    valid_valid_mask,
 ):
     np.savez(
         os.path.join(exp_dir, "results.npz"),
@@ -509,6 +345,8 @@ def save_results_npz(
         valid_truth=np.asarray(valid_truth, dtype=float),
         train_lambdas=np.asarray(train_lambdas, dtype=float),
         valid_lambdas=np.asarray(valid_lambdas, dtype=float),
+        train_valid_mask=np.asarray(train_valid_mask, dtype=bool),
+        valid_valid_mask=np.asarray(valid_valid_mask, dtype=bool),
     )
 
 
@@ -623,6 +461,8 @@ def run_one_architecture(
                 valid_truth=valid_data.qs,
                 train_lambdas=train_data.lambdas,
                 valid_lambdas=valid_data.lambdas,
+                train_valid_mask=train_data.valid,
+                valid_valid_mask=valid_data.valid,
             )
 
         # -------------------------
@@ -689,6 +529,8 @@ def run_one_architecture(
             "valid_truth": np.asarray(valid_data.qs),
             "train_lambdas": np.asarray(train_data.lambdas),
             "valid_lambdas": np.asarray(valid_data.lambdas),
+            "train_valid_mask": np.asarray(train_data.valid),
+            "valid_valid_mask": np.asarray(valid_data.valid),
             "exp_dir": exp_dir,
             "exp_name": experiment_name(spec, cfg),
             "success": True,
@@ -727,6 +569,8 @@ def run_one_architecture(
             "valid_truth": None,
             "train_lambdas": None,
             "valid_lambdas": None,
+            "train_valid_mask": None,
+            "valid_valid_mask": None,
             "exp_dir": exp_dir,
             "exp_name": experiment_name(spec, cfg),
             "success": False,
