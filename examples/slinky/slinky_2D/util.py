@@ -243,11 +243,23 @@ def train_model(
 
     model = model_cls(params)
 
-    # Optax: AdaBelief
+
+    schedule = optax.cosine_decay_schedule(
+        init_value=lr,
+        decay_steps=n_epochs + 1,
+        alpha=0.1,
+    )
+    # Optax: Adam
     opt = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adabelief(learning_rate=lr),
-    )
+        optax.adam(learning_rate=schedule),
+    ) 
+
+    # # Optax: AdaBelief
+    # opt = optax.chain(
+    #     optax.clip_by_global_norm(1.0),
+    #     optax.adabelief(learning_rate=lr),
+    # )
 
     opt_state = opt.init(model)
 

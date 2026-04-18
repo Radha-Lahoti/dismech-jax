@@ -37,7 +37,7 @@ class SlinkyN5Properties(Properties):
     density: float = 1200.0
     E: float = 1e6
     N: int = 7 # since we add clamped points at the ends artificially in the data
-    mass: float = 0.1
+    mass: float = 0.05
 
 @dataclass
 class StripN9Properties(Properties):
