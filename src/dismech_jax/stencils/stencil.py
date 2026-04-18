@@ -79,6 +79,7 @@ class Stencil(eqx.Module, Generic[AuxT]):
         te = ee / norm_e
         tf = ef / norm_f
         chi = 1.0 + jnp.sum(te * tf)
+        # jax.debug.print("chi = {}, small = {}", chi, chi < 1e-6)
         kb = 2.0 * jnp.cross(te, tf) / chi
         kappa1 = 0.5 * jnp.sum(kb * (m2e + m2f))
         kappa2 = -0.5 * jnp.sum(kb * (m1e + m1f))

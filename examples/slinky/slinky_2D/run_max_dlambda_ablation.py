@@ -589,6 +589,8 @@ if __name__ == "__main__":
     )
 
     selected_architectures = [
+        "mlp_energy",
+        "icnn_energy",
         "diag_energy_baseline",
         "chol_stiffness_mlp",
     ]

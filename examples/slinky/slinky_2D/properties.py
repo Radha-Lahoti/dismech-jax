@@ -32,12 +32,12 @@ class SlinkyN3Properties(Properties):
 
 @dataclass
 class SlinkyN5Properties(Properties):
-    length: float = 0.20
+    length: float = 0.33
     r0: float = 0.005
     density: float = 1200.0
     E: float = 1e6
-    N: int = 5
-    mass: float = 0.3
+    N: int = 7 # since we add clamped points at the ends artificially in the data
+    mass: float = 0.1
 
 @dataclass
 class StripN9Properties(Properties):

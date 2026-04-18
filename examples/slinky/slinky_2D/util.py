@@ -29,6 +29,18 @@ class Dataset(eqx.Module):
             valid=jnp.asarray(data["valid"]),
         )
 
+
+def validate_dataset_compatibility(base, data: Dataset, label: str):
+    expected_dof = base.q0.shape[0]
+    actual_dof = data.qs.shape[-1]
+    if actual_dof != expected_dof:
+        inferred_n = (actual_dof + 1) // 4
+        base_n = (expected_dof + 1) // 4
+        raise ValueError(
+            f"{label} dataset dof ({actual_dof}) does not match base rod dof ({expected_dof}). "
+            f"This dataset appears to require N={inferred_n} nodes, but the current properties use N={base_n}."
+        )
+
 # =========================================================
 # Base slinky rod (fixed)
 # =========================================================
@@ -226,6 +238,8 @@ def train_model(
     base, aux = get_slinky(properties)
     train = Dataset.load(train_file)
     valid = Dataset.load(valid_file)
+    validate_dataset_compatibility(base, train, "train")
+    validate_dataset_compatibility(base, valid, "valid")
 
     model = model_cls(params)
 

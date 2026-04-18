@@ -15,6 +15,7 @@ from util import Dataset, get_slinky, predict, train_model
 from util_energy_plots import EnergyLandscapeSpec, make_energy_snapshot_fn
 from Energy_NN_architectures import (
     ModelParams,
+    ScalarEnergyNN,
     DiagonalPlusEnergyNN,
     CholeskyPlusEnergyNN,
     DiagonalPlusStiffnessNN,
@@ -51,6 +52,16 @@ def build_architecture_registry() -> dict[str, ArchSpec]:
         "diag_energy_icnn": ArchSpec(
             name="diag_energy_icnn",
             model_cls=DiagonalPlusEnergyNN,
+            which_case="ICNN",
+        ),
+        "mlp_energy": ArchSpec(
+            name="mlp_energy",
+            model_cls=ScalarEnergyNN,
+            which_case="MLP",
+        ),
+        "icnn_energy": ArchSpec(
+            name="icnn_energy",
+            model_cls=ScalarEnergyNN,
             which_case="ICNN",
         ),
         "chol_energy_baseline": ArchSpec(
@@ -174,7 +185,15 @@ def is_cholesky_family(model_cls: type) -> bool:
     )
 
 
+def is_scalar_energy_family(model_cls: type) -> bool:
+    return model_cls is ScalarEnergyNN
+
+
 def get_der_K_for_model(cfg: SweepConfig, model_cls: type) -> jax.Array:
+    if is_scalar_energy_family(model_cls):
+        # ScalarEnergyNN does not use baseline stiffness entries, but ModelParams
+        # still carries der_K, so provide a harmless placeholder.
+        return jnp.asarray(cfg.der_K_diag)
     if is_diagonal_family(model_cls):
         return jnp.asarray(cfg.der_K_diag)
     if is_cholesky_family(model_cls):
@@ -789,6 +808,8 @@ def subset_energy_only() -> list[str]:
         "diag_energy_baseline",
         "diag_energy_mlp",
         "diag_energy_icnn",
+        "mlp_energy",
+        "icnn_energy",
         "chol_energy_baseline",
         "chol_energy_mlp",
         "chol_energy_icnn",

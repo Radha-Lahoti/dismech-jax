@@ -6,6 +6,21 @@ from .states import State
 from .systems import System
 
 
+def update_aux_state(
+    aux: State,
+    q: jax.Array,
+    sys: System,
+) -> State:
+    if aux is None:
+        return aux
+
+    if hasattr(sys, "_global_q_to_batch_q"):
+        batch_q = sys._global_q_to_batch_q(q)
+        return jax.vmap(lambda a, q_loc: a.update(q_loc))(aux, batch_q)
+
+    return jax.vmap(lambda a: a.update(q))(aux)
+
+
 def compute_ift_gradient(
     _lambda: jax.Array,
     q_star: jax.Array,
@@ -49,38 +64,42 @@ def solve_step(
     """
     alphas = 0.5 ** jnp.arange(ls_steps)
 
+    q_init = sys.get_q(_lambda, q0)
+    aux_init = update_aux_state(aux, q_init, sys)
+
     def newton_step(carry, _):
-        q, e_old, res = carry
+        q, aux_cur, e_old, res = carry
 
         # Newton system
-        H = sys.get_H(_lambda, q, model, aux)
+        H = sys.get_H(_lambda, q, model, aux_cur)
         H_reg = H.at[jnp.diag_indices(H.shape[0])].add(1e-8)
         delta_q = jnp.linalg.solve(H_reg, res)
         slope = jnp.dot(res, delta_q)
 
         # Parallel line search
         test_qs = q + alphas[:, None] * delta_q
-        test_energies = jax.vmap(lambda _q: sys.get_E(_lambda, _q, model, aux))(test_qs)
+        test_energies = jax.vmap(lambda _q: sys.get_E(_lambda, _q, model, aux_cur))(test_qs)
 
-        # Armijo condition
-        is_good = test_energies <= e_old + c1 * alphas * slope
+        # Since res = -grad(E), the directional derivative is grad(E)^T dq = -res^T dq.
+        # Armijo therefore uses a decrease bound with a minus sign here.
+        is_good = test_energies <= e_old - c1 * alphas * slope
 
         # If Armijo fails, take the smallest possible step
         safe_idx = jnp.where(jnp.any(is_good), jnp.argmax(is_good), ls_steps - 1)
 
         next_q = test_qs[safe_idx]
         next_e = test_energies[safe_idx]
-        next_res = -sys.get_F(_lambda, next_q, model, aux)
+        next_aux = update_aux_state(aux_cur, next_q, sys)
+        next_res = -sys.get_F(_lambda, next_q, model, next_aux)
 
-        return (next_q, next_e, next_res), None
+        return (next_q, next_aux, next_e, next_res), None
 
-    q_init = sys.get_q(_lambda, q0)
-    init_e = sys.get_E(_lambda, q_init, model, aux)
-    init_res = -sys.get_F(_lambda, q_init, model, aux)
+    init_e = sys.get_E(_lambda, q_init, model, aux_init)
+    init_res = -sys.get_F(_lambda, q_init, model, aux_init)
     init_res_norm = jnp.linalg.norm(init_res)
 
-    (final_q, _, final_res), _ = jax.lax.scan(
-        newton_step, (q_init, init_e, init_res), None, iters
+    (final_q, _, _, final_res), _ = jax.lax.scan(
+        newton_step, (q_init, aux_init, init_e, init_res), None, iters
     )
 
     final_res_norm = jnp.linalg.norm(final_res)
@@ -172,7 +191,7 @@ def solve(
                 iters, ls_steps, c1,
                 abs_tol, rel_tol, fail_on_nonconvergence
             )
-            new_aux = jax.vmap(lambda a: a.update(new_q))(aux) if aux else aux
+            new_aux = update_aux_state(aux, new_q, sys)
             return new_q, new_aux, next_L
 
         final_q, final_aux, final_L = jax.lax.while_loop(
@@ -185,7 +204,7 @@ def solve(
         iters, ls_steps, c1,
         abs_tol, rel_tol, fail_on_nonconvergence
     )
-    aux_start = jax.vmap(lambda a: a.update(q_start))(aux) if aux else aux
+    aux_start = update_aux_state(aux, q_start, sys)
     _, qs = jax.lax.scan(scan_fn, (q_start, aux_start, lambdas[0]), lambdas)
     return qs
 
@@ -221,7 +240,7 @@ def solve_fwd(
                 iters, ls_steps, c1,
                 abs_tol, rel_tol, fail_on_nonconvergence
             )
-            new_aux = jax.vmap(lambda a: a.update(new_q))(aux) if aux else aux
+            new_aux = update_aux_state(aux, new_q, sys)
             return new_q, new_aux, next_L
 
         final_q, final_aux, final_L = jax.lax.while_loop(
@@ -234,7 +253,7 @@ def solve_fwd(
         iters, ls_steps, c1,
         abs_tol, rel_tol, fail_on_nonconvergence
     )
-    aux_start = jax.vmap(lambda a: a.update(q_start))(aux) if aux else aux
+    aux_start = update_aux_state(aux, q_start, sys)
 
     _, (qs, auxs) = jax.lax.scan(
         scan_fwd_fn, (q_start, aux_start, lambdas[0]), lambdas
@@ -298,7 +317,7 @@ def solve_with_aux(
                 iters, ls_steps, c1,
                 abs_tol, rel_tol, fail_on_nonconvergence
             )
-            new_aux = jax.vmap(lambda a: a.update(new_q))(aux) if aux else aux
+            new_aux = update_aux_state(aux, new_q, sys)
             return new_q, new_aux, next_L
 
         final_q, final_aux, final_L = jax.lax.while_loop(
@@ -311,7 +330,7 @@ def solve_with_aux(
         iters, ls_steps, c1,
         abs_tol, rel_tol, fail_on_nonconvergence
     )
-    aux_start = jax.vmap(lambda a: a.update(q_start))(aux) if aux else aux
+    aux_start = update_aux_state(aux, q_start, sys)
 
     _, (qs, auxs) = jax.lax.scan(
         scan_fn, (q_start, aux_start, lambdas[0]), lambdas

@@ -209,6 +209,41 @@ class ScalarICNN(eqx.Module):
         return jax.nn.softplus(y) if self.positive_output else y
 
 
+class ScalarNet(eqx.Module):
+    net: eqx.Module
+
+    def __init__(
+        self,
+        net_type: str,
+        in_features: int,
+        hidden: tuple[int, ...],
+        key: jax.Array,
+        *,
+        positive_output: bool,
+        activation: str = "softplus",
+    ):
+        if net_type == "MLP":
+            self.net = ScalarMLP(
+                in_features=in_features,
+                hidden=hidden,
+                key=key,
+                positive_output=positive_output,
+                activation=activation,
+            )
+        elif net_type == "ICNN":
+            self.net = ScalarICNN(
+                in_features=in_features,
+                hidden=hidden,
+                key=key,
+                positive_output=positive_output,
+            )
+        else:
+            raise ValueError("net_type must be 'MLP' or 'ICNN'.")
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return self.net(x)
+
+
 # ===================================================================================== #
 # Shared vector nets
 # ===================================================================================== #
@@ -338,6 +373,58 @@ class VectorNet(eqx.Module):
 
     def __call__(self, x: jax.Array) -> jax.Array:
         return self.net(x)
+
+
+# ===================================================================================== #
+# 0) ScalarEnergyNN
+# ===================================================================================== #
+class ScalarEnergyNN(eqx.Module):
+    mlp: ScalarNet
+    icnn: ScalarNet
+    which_case: str = eqx.field(static=True)
+    zero_reference: bool = eqx.field(static=True)
+    corr_factor: float = eqx.field(static=True)
+    input_mode: str = eqx.field(static=True)
+
+    def __init__(self, params: ModelParams):
+        in_features = _nn_in_features(params.input_mode)
+
+        self.mlp = ScalarNet(
+            "MLP",
+            in_features,
+            params.hidden,
+            params.key,
+            positive_output=False,
+            activation=params.activation,
+        )
+        self.icnn = ScalarNet(
+            "ICNN",
+            in_features,
+            params.hidden,
+            jax.random.fold_in(params.key, 1),
+            positive_output=False,
+        )
+        self.which_case = params.which_case
+        self.zero_reference = params.zero_reference
+        self.corr_factor = params.corr_factor
+        self.input_mode = params.input_mode
+
+    def _net_output(self, x: jax.Array) -> jax.Array:
+        if self.which_case == "MLP":
+            return self.mlp(x)
+        if self.which_case == "ICNN":
+            return self.icnn(x)
+        raise ValueError("which_case must be 'MLP' or 'ICNN'.")
+
+    def __call__(self, del_strain: jax.Array) -> jax.Array:
+        x = get_nn_input(del_strain, self.input_mode)
+        y = self._net_output(x)
+
+        if self.zero_reference:
+            y = y - self._net_output(jnp.zeros_like(x))
+
+        # Standalone energy should be exactly zero at the reference and nonnegative.
+        return self.corr_factor * y**2
 # ===================================================================================== #
 # Shared bases
 # ===================================================================================== #
