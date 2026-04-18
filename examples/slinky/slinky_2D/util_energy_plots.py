@@ -15,8 +15,8 @@ import dismech_jax as djx
 @dataclass
 class EnergyLandscapeSpec:
     strain_x_idx: int = 0
-    strain_y_idx: int = 1
-    triplet_idx: int = 0
+    strain_y_idx: int = 3
+    triplet_idx: Optional[int] = None
     traj_idx: int = 0
 
     # grid / view
@@ -82,10 +82,26 @@ def solve_with_strain_history(
 # =========================================================
 # Strain-path extraction
 # =========================================================
+def resolve_triplet_idx(n_triplets, triplet_idx=None):
+    if n_triplets <= 0:
+        raise ValueError(f"Expected at least one triplet, got n_triplets={n_triplets}")
+
+    if triplet_idx is not None:
+        if not 0 <= triplet_idx < n_triplets:
+            raise IndexError(
+                f"triplet_idx={triplet_idx} out of bounds for n_triplets={n_triplets}"
+            )
+        return int(triplet_idx)
+
+    # Auto-pick the rod-center triplet. For an even number of nodes there are two
+    # middle nodes, which correspond to the two middle triplets; choose the lower.
+    return (n_triplets - 1) // 2
+
+
 def extract_strain_path(
     del_strains,
     traj_idx=0,
-    triplet_idx=0,
+    triplet_idx=None,
 ):
     """
     Returns
@@ -102,6 +118,7 @@ def extract_strain_path(
             "or (B, T, n_triplets, n_strain)"
         )
 
+    triplet_idx = resolve_triplet_idx(arr.shape[1], triplet_idx)
     return arr[:, triplet_idx, :]
 
 
@@ -183,6 +200,12 @@ def _get_axis_labels(spec: EnergyLandscapeSpec):
     )
 
 
+def _get_triplet_label(spec: EnergyLandscapeSpec):
+    if spec.triplet_idx is None:
+        return "center triplet"
+    return f"triplet {spec.triplet_idx}"
+
+
 def plot_energy_landscape_from_path(
     model,
     path,
@@ -244,7 +267,7 @@ def plot_energy_landscape_from_path(
     ax.set_ylabel(ylabel)
     ax.set_title(
         spec_eval.title
-        or f"Energy landscape with visited strain path (triplet {spec_eval.triplet_idx})"
+        or f"Energy landscape with visited strain path ({_get_triplet_label(spec_eval)})"
     )
 
     if spec_eval.show_colorbar and contour_artist is not None:
@@ -289,16 +312,22 @@ def save_energy_landscape_snapshot_from_solution(
     os.makedirs(save_dir, exist_ok=True)
     stem = _snapshot_stem(epoch=epoch, tag=tag)
 
+    resolved_triplet_idx = resolve_triplet_idx(
+        np.asarray(del_strains).shape[-2],
+        spec.triplet_idx,
+    )
+    spec_local = replace(spec, triplet_idx=resolved_triplet_idx)
+
     path = extract_strain_path(
         del_strains,
-        traj_idx=spec.traj_idx,
-        triplet_idx=spec.triplet_idx,
+        traj_idx=spec_local.traj_idx,
+        triplet_idx=spec_local.triplet_idx,
     )
 
     fig, ax, out = plot_energy_landscape_from_path(
         model=model,
         path=path,
-        spec=spec,
+        spec=spec_local,
         ax=None,
     )
 
