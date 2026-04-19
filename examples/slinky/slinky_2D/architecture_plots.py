@@ -1,4 +1,5 @@
 import os
+import warnings
 from typing import Optional
 
 import matplotlib.cm as cm
@@ -51,6 +52,46 @@ def plot_loss_curves(
     ax.set_title(title)
     ax.set_xlabel("Epoch")
     ax.set_ylabel("MSE loss")
+    ax.legend()
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def plot_baseline_stiffness_history(
+    epochs,
+    values,
+    labels,
+    title: str,
+    save_path: Optional[str] = None,
+    show: bool = False,
+):
+    epochs = _to_numpy(epochs)
+    values = _to_numpy(values)
+
+    if values.ndim != 2:
+        raise ValueError(f"Expected values with shape (n_epochs, n_components), got {values.shape}")
+    if values.shape[1] != len(labels):
+        raise ValueError(
+            f"Expected len(labels)={len(labels)} to match values.shape[1]={values.shape[1]}"
+        )
+
+    fig, ax = plt.subplots(figsize=(7.5, 5.0))
+    colors = cm.viridis(np.linspace(0, 1, values.shape[1]))
+
+    for i, label in enumerate(labels):
+        ax.plot(epochs, values[:, i], linewidth=2.0, color=colors[i], label=label)
+
+    ax.set_title(title)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Baseline Stiffness")
     ax.legend()
     ax.grid(True, alpha=0.25)
     fig.tight_layout()
@@ -337,13 +378,30 @@ def _paper_rc_params():
 
 
 def _architecture_colors(architectures: list[str]) -> dict[str, tuple]:
-    cmap = plt.get_cmap("tab20")
-    colors = cmap(np.linspace(0, 1, max(len(architectures), 1)))
-    return {arch: colors[i] for i, arch in enumerate(architectures)}
+    cmap = plt.get_cmap("tab10")
+    return {arch: cmap(i % cmap.N) for i, arch in enumerate(architectures)}
 
 
 def _save_pdf(fig, path: str):
     fig.savefig(path, format="pdf", dpi=600, bbox_inches="tight", transparent=False)
+
+
+def _truth_marker_kwargs(split: str) -> dict:
+    if split == "train":
+        return {
+            "color": "0.55",
+            "markerfacecolor": "0.55",
+            "markeredgecolor": "none",
+            "markeredgewidth": 0.0,
+            "alpha": 0.55,
+        }
+    return {
+        "color": "0.45",
+        "markerfacecolor": "none",
+        "markeredgecolor": "0.45",
+        "markeredgewidth": 0.8,
+        "alpha": 0.7,
+    }
 
 
 def _plot_loss_comparison(
@@ -406,52 +464,252 @@ def _plot_trajectory_comparison(
         truth_x = truth[:, :, x_idx].reshape(-1)
         truth_z = truth[:, :, z_idx].reshape(-1)
         xlabel = "BC Step Index"
+        has_data = True
     else:
-        if traj_idx >= truth.shape[0]:
-            raise IndexError(
-                f"traj_idx={traj_idx} is out of bounds for split '{split}' with {truth.shape[0]} trajectories."
-            )
-        lam_plot = lambdas if lambdas.ndim == 1 else lambdas[traj_idx]
-        truth_x = truth[traj_idx, :, x_idx]
-        truth_z = truth[traj_idx, :, z_idx]
+        has_data = 0 <= traj_idx < truth.shape[0]
+        if has_data:
+            lam_plot = lambdas if lambdas.ndim == 1 else lambdas[traj_idx]
+            truth_x = truth[traj_idx, :, x_idx]
+            truth_z = truth[traj_idx, :, z_idx]
+        else:
+            lam_plot = None
+            truth_x = None
+            truth_z = None
         xlabel = r"$\lambda$"
 
     with plt.rc_context(_paper_rc_params()):
         fig, axes = plt.subplots(1, 2, figsize=(7.0, 3.1), constrained_layout=True)
         ax_x, ax_z = axes
 
-        for arch in architectures:
-            pred = np.asarray(results_by_arch[arch][pred_key], dtype=float)
-            if traj_idx is None:
-                pred_x = pred[:, :, x_idx].reshape(-1)
-                pred_z = pred[:, :, z_idx].reshape(-1)
-            else:
-                pred_x = pred[traj_idx, :, x_idx]
-                pred_z = pred[traj_idx, :, z_idx]
-            color = colors[arch]
+        if has_data:
+            for arch in architectures:
+                pred = np.asarray(results_by_arch[arch][pred_key], dtype=float)
+                if traj_idx is None:
+                    pred_x = pred[:, :, x_idx].reshape(-1)
+                    pred_z = pred[:, :, z_idx].reshape(-1)
+                else:
+                    pred_x = pred[traj_idx, :, x_idx]
+                    pred_z = pred[traj_idx, :, z_idx]
+                color = colors[arch]
 
-            ax_x.plot(lam_plot, pred_x, color=color, linewidth=1.6, label=arch)
-            ax_z.plot(lam_plot, pred_z, color=color, linewidth=1.6, label=arch)
+                ax_x.plot(lam_plot, pred_x, color=color, linewidth=1.6, label=arch)
+                ax_z.plot(lam_plot, pred_z, color=color, linewidth=1.6, label=arch)
 
-        ax_x.plot(lam_plot, truth_x, color="black", linestyle="--", linewidth=1.8, label="ground truth")
-        ax_z.plot(lam_plot, truth_z, color="black", linestyle="--", linewidth=1.8, label="ground truth")
+            ax_x.plot(lam_plot, truth_x, color="black", linestyle="--", linewidth=1.8, label="ground truth")
+            ax_z.plot(lam_plot, truth_z, color="black", linestyle="--", linewidth=1.8, label="ground truth")
+        else:
+            missing_msg = (
+                f"traj_idx={traj_idx} is unavailable for split '{split}' "
+                f"(available trajectories: 0..{truth.shape[0] - 1})."
+            )
+            for ax, component in zip((ax_x, ax_z), ("x", "z")):
+                ax.text(
+                    0.5,
+                    0.5,
+                    f"No {split} trajectory data\nfor traj_idx={traj_idx}",
+                    transform=ax.transAxes,
+                    ha="center",
+                    va="center",
+                )
+                ax.set_title(f"{component} component")
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.grid(False)
+            fig.suptitle(missing_msg)
 
         ax_x.set_xlabel(xlabel)
         ax_z.set_xlabel(xlabel)
         ax_x.set_ylabel(f"Center Node {center_node} x Position (m)")
         ax_z.set_ylabel(f"Center Node {center_node} z Position (m)")
-        ax_x.grid(True, alpha=0.18, linewidth=0.6)
-        ax_z.grid(True, alpha=0.18, linewidth=0.6)
+        if has_data:
+            ax_x.grid(True, alpha=0.18, linewidth=0.6)
+            ax_z.grid(True, alpha=0.18, linewidth=0.6)
 
-        handles, labels = ax_x.get_legend_handles_labels()
-        fig.legend(
-            handles,
-            labels,
-            loc="upper center",
-            ncol=min(4, len(labels)),
-            frameon=False,
-            bbox_to_anchor=(0.5, 1.05),
-        )
+            handles, labels = ax_x.get_legend_handles_labels()
+            fig.legend(
+                handles,
+                labels,
+                loc="upper center",
+                ncol=min(4, len(labels)),
+                frameon=False,
+                bbox_to_anchor=(0.5, 1.05),
+            )
+        _save_pdf(fig, save_path)
+        plt.close(fig)
+
+
+def _plot_xz_trajectory_comparison(
+    results_by_arch: dict[str, dict],
+    architectures: list[str],
+    colors: dict[str, tuple],
+    split: str,
+    save_path: str,
+    x_idx: Optional[int],
+    z_idx: Optional[int],
+):
+    pred_key = "train_pred" if split == "train" else "valid_pred"
+    truth_key = "train_truth" if split == "train" else "valid_truth"
+
+    first = results_by_arch[architectures[0]]
+    truth = np.asarray(first[truth_key], dtype=float)
+
+    if truth.ndim != 3:
+        raise ValueError(f"Expected {truth_key} to have shape (n_traj, T, dof), got {truth.shape}")
+
+    center_node, default_x_idx, default_z_idx = _get_center_node_xz_indices(truth)
+    if x_idx is None:
+        x_idx = default_x_idx
+    if z_idx is None:
+        z_idx = default_z_idx
+
+    with plt.rc_context(_paper_rc_params()):
+        fig, ax = plt.subplots(figsize=(5.0, 4.4), constrained_layout=True)
+
+        truth_label = "ground truth"
+        for traj_idx in range(truth.shape[0]):
+            label = truth_label if traj_idx == 0 else None
+            ax.plot(
+                truth[traj_idx, :, x_idx],
+                truth[traj_idx, :, z_idx],
+                linestyle="None",
+                marker="o",
+                markersize=2.8,
+                label=label,
+                **_truth_marker_kwargs(split),
+            )
+
+        for arch in architectures:
+            pred = np.asarray(results_by_arch[arch][pred_key], dtype=float)
+            if pred.shape[:2] != truth.shape[:2]:
+                raise ValueError(
+                    f"Expected {pred_key} for architecture '{arch}' to have first two "
+                    f"dimensions {truth.shape[:2]}, got {pred.shape}."
+                )
+
+            for traj_idx in range(pred.shape[0]):
+                label = arch if traj_idx == 0 else None
+                ax.plot(
+                    pred[traj_idx, :, x_idx],
+                    pred[traj_idx, :, z_idx],
+                    color=colors[arch],
+                    linewidth=1.2,
+                    alpha=0.75,
+                    label=label,
+                )
+
+        ax.set_xlabel(f"Center Node {center_node} x Position (m)")
+        ax.set_ylabel(f"Center Node {center_node} z Position (m)")
+        ax.grid(True, alpha=0.18, linewidth=0.6)
+        ax.legend(frameon=False, ncol=2)
+        ax.set_aspect("equal", adjustable="datalim")
+        _save_pdf(fig, save_path)
+        plt.close(fig)
+
+
+def _plot_combined_xz_trajectory_comparison(
+    results_by_arch: dict[str, dict],
+    architectures: list[str],
+    colors: dict[str, tuple],
+    save_path: str,
+    x_idx: Optional[int],
+    z_idx: Optional[int],
+):
+    first = results_by_arch[architectures[0]]
+    train_truth = np.asarray(first["train_truth"], dtype=float)
+    valid_truth = np.asarray(first["valid_truth"], dtype=float)
+
+    if train_truth.ndim != 3:
+        raise ValueError(f"Expected train_truth to have shape (n_traj, T, dof), got {train_truth.shape}")
+    if valid_truth.ndim != 3:
+        raise ValueError(f"Expected valid_truth to have shape (n_traj, T, dof), got {valid_truth.shape}")
+
+    center_node, default_x_idx, default_z_idx = _get_center_node_xz_indices(train_truth)
+    if x_idx is None:
+        x_idx = default_x_idx
+    if z_idx is None:
+        z_idx = default_z_idx
+
+    split_specs = {
+        "train": {
+            "truth_key": "train_truth",
+            "pred_key": "train_pred",
+            "prediction_linestyle": "-",
+        },
+        "valid": {
+            "truth_key": "valid_truth",
+            "pred_key": "valid_pred",
+            "prediction_linestyle": "--",
+        },
+    }
+
+    with plt.rc_context(_paper_rc_params()):
+        fig, ax = plt.subplots(figsize=(5.4, 4.6), constrained_layout=True)
+
+        for split, spec in split_specs.items():
+            truth = np.asarray(first[spec["truth_key"]], dtype=float)
+            for traj_idx in range(truth.shape[0]):
+                ax.plot(
+                    truth[traj_idx, :, x_idx],
+                    truth[traj_idx, :, z_idx],
+                    linestyle="None",
+                    marker="o",
+                    markersize=2.8,
+                    **_truth_marker_kwargs(split),
+                )
+
+            for arch in architectures:
+                pred = np.asarray(results_by_arch[arch][spec["pred_key"]], dtype=float)
+                if pred.shape[:2] != truth.shape[:2]:
+                    raise ValueError(
+                        f"Expected {spec['pred_key']} for architecture '{arch}' to have first two "
+                        f"dimensions {truth.shape[:2]}, got {pred.shape}."
+                    )
+
+                for traj_idx in range(pred.shape[0]):
+                    ax.plot(
+                        pred[traj_idx, :, x_idx],
+                        pred[traj_idx, :, z_idx],
+                        color=colors[arch],
+                        linestyle=spec["prediction_linestyle"],
+                        linewidth=1.15,
+                        alpha=0.78,
+                    )
+
+        architecture_handles = [
+            mlines.Line2D([], [], color=colors[arch], linewidth=1.6, label=arch)
+            for arch in architectures
+        ]
+        split_handles = [
+            mlines.Line2D([], [], color="0.25", linestyle="-", linewidth=1.3, label="train prediction"),
+            mlines.Line2D([], [], color="0.25", linestyle="--", linewidth=1.3, label="test prediction"),
+            mlines.Line2D(
+                [],
+                [],
+                color="0.55",
+                marker="o",
+                linestyle="None",
+                markersize=4.0,
+                markeredgecolor="none",
+                label="train ground truth",
+            ),
+            mlines.Line2D(
+                [],
+                [],
+                color="0.45",
+                marker="o",
+                linestyle="None",
+                markersize=4.0,
+                markerfacecolor="none",
+                markeredgecolor="0.45",
+                label="test ground truth",
+            ),
+        ]
+
+        ax.set_xlabel(f"Center Node {center_node} x Position (m)")
+        ax.set_ylabel(f"Center Node {center_node} z Position (m)")
+        ax.grid(True, alpha=0.18, linewidth=0.6)
+        ax.legend(handles=architecture_handles + split_handles, frameon=False, ncol=2)
+        ax.set_aspect("equal", adjustable="datalim")
         _save_pdf(fig, save_path)
         plt.close(fig)
 
@@ -487,6 +745,11 @@ def plot_architecture_comparison_paper(
     """
     if len(architectures) == 0:
         raise ValueError("architectures must contain at least one architecture name.")
+    if not isinstance(results_dir, (str, bytes, os.PathLike)):
+        raise TypeError(
+            "results_dir must be a path string or os.PathLike. "
+            "Did you pass Python's built-in dir instead of a results directory variable?"
+        )
 
     if output_dir is None:
         output_dir = os.path.join(results_dir, "paper_ready_architecture_comparison")
@@ -496,6 +759,25 @@ def plot_architecture_comparison_paper(
     for arch in architectures:
         results_path = _find_architecture_results_path(results_dir, arch)
         results_by_arch[arch] = _load_results_file(results_path)
+
+    if traj_idx is not None:
+        split_to_truth_key = {
+            "train": "train_truth",
+            "valid": "valid_truth",
+        }
+        for split, truth_key in split_to_truth_key.items():
+            split_truth = np.asarray(results_by_arch[architectures[0]][truth_key], dtype=float)
+            if split_truth.ndim != 3:
+                raise ValueError(
+                    f"Expected {truth_key} to have shape (n_traj, T, dof), got {split_truth.shape}"
+                )
+            if not (0 <= traj_idx < split_truth.shape[0]):
+                warnings.warn(
+                    f"traj_idx={traj_idx} is unavailable for split '{split}' "
+                    f"(available trajectories: 0..{split_truth.shape[0] - 1}). "
+                    "That figure will be left empty while the other split is still plotted if available.",
+                    stacklevel=2,
+                )
 
     colors = _architecture_colors(architectures)
 
@@ -533,11 +815,40 @@ def plot_architecture_comparison_paper(
         x_idx=x_idx,
         z_idx=z_idx,
     )
+    _plot_xz_trajectory_comparison(
+        results_by_arch=results_by_arch,
+        architectures=architectures,
+        colors=colors,
+        split="train",
+        save_path=os.path.join(output_dir, "training_xz_trajectory_comparison.pdf"),
+        x_idx=x_idx,
+        z_idx=z_idx,
+    )
+    _plot_xz_trajectory_comparison(
+        results_by_arch=results_by_arch,
+        architectures=architectures,
+        colors=colors,
+        split="valid",
+        save_path=os.path.join(output_dir, "validation_xz_trajectory_comparison.pdf"),
+        x_idx=x_idx,
+        z_idx=z_idx,
+    )
+    _plot_combined_xz_trajectory_comparison(
+        results_by_arch=results_by_arch,
+        architectures=architectures,
+        colors=colors,
+        save_path=os.path.join(output_dir, "combined_xz_trajectory_comparison.pdf"),
+        x_idx=x_idx,
+        z_idx=z_idx,
+    )
 
     return {
         "training_loss": os.path.join(output_dir, "training_loss_comparison.pdf"),
         "validation_loss": os.path.join(output_dir, "validation_loss_comparison.pdf"),
         "training_trajectory": os.path.join(output_dir, "training_trajectory_comparison.pdf"),
         "validation_trajectory": os.path.join(output_dir, "validation_trajectory_comparison.pdf"),
+        "training_xz_trajectory": os.path.join(output_dir, "training_xz_trajectory_comparison.pdf"),
+        "validation_xz_trajectory": os.path.join(output_dir, "validation_xz_trajectory_comparison.pdf"),
+        "combined_xz_trajectory": os.path.join(output_dir, "combined_xz_trajectory_comparison.pdf"),
         "colors": colors,
     }

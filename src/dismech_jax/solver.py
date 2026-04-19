@@ -111,7 +111,7 @@ def solve_step(
         final_q = eqx.error_if(
             final_q,
             ~converged,
-            "Newton solve did not converge within the prescribed fixed iterations.",
+            ("Newton solve did not converge. Residual norm: {}", final_res_norm)
         )
 
     return final_q

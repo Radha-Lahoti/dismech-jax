@@ -438,6 +438,9 @@ class _DiagonalBase:
     def get_K0(self) -> jax.Array:
         return jax.nn.softplus(self.K0_raw)
 
+    def get_baseline_K_entries(self) -> jax.Array:
+        return self.get_K0()
+
     def _diag_energy_from_entries(
         self, k_s: jax.Array, k_b: jax.Array, del_strain: jax.Array
     ) -> jax.Array:
@@ -464,6 +467,9 @@ class _CholeskyBase:
     def get_B0(self) -> jax.Array:
         L0 = _vec_to_L(self.K0_raw)
         return L0 @ L0.T
+
+    def get_baseline_K_entries(self) -> jax.Array:
+        return self._B_to_entries(self.get_B0())
 
     @staticmethod
     def _B_to_entries(B: jax.Array) -> jax.Array:

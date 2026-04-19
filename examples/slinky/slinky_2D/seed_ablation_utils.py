@@ -1,9 +1,11 @@
 import os
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Optional
 
 import numpy as np
+import matplotlib.lines as mlines
 import matplotlib.pyplot as plt
 
 from run_architectures import (
@@ -30,6 +32,119 @@ def _final_or_nan(hist):
     if arr.size == 0:
         return np.nan
     return float(arr[-1])
+
+
+def _trajectory_valid_mask(result: dict, split: str, traj_idx: int, length: int) -> np.ndarray:
+    mask_key = f"{split}_valid_mask"
+    if mask_key not in result or result[mask_key] is None:
+        return np.ones(length, dtype=bool)
+
+    mask = np.asarray(result[mask_key], dtype=bool)
+    if mask.ndim != 2:
+        raise ValueError(f"Expected {mask_key} to have shape (n_traj, T), got {mask.shape}")
+    if not (0 <= traj_idx < mask.shape[0]):
+        raise IndexError(
+            f"traj_idx={traj_idx} is out of bounds for {mask_key} with {mask.shape[0]} trajectories."
+        )
+    if mask.shape[1] != length:
+        raise ValueError(
+            f"Expected {mask_key} time dimension to be {length}, got {mask.shape[1]}."
+        )
+
+    traj_mask = mask[traj_idx]
+    if not np.any(traj_mask):
+        raise ValueError(f"{mask_key}[{traj_idx}] contains no valid samples to plot.")
+
+    return traj_mask
+
+
+def _trajectory_lambda_axis(result: dict, split: str, traj_idx: int, valid_mask: np.ndarray) -> tuple[np.ndarray, str]:
+    lambdas_key = f"{split}_lambdas"
+    if lambdas_key not in result or result[lambdas_key] is None:
+        return np.arange(np.sum(valid_mask)), "valid lambda index"
+
+    lambdas = np.asarray(result[lambdas_key], dtype=float)
+    if lambdas.ndim == 1:
+        if lambdas.shape[0] != valid_mask.shape[0]:
+            raise ValueError(
+                f"Expected {lambdas_key} length to be {valid_mask.shape[0]}, got {lambdas.shape[0]}."
+            )
+        return lambdas[valid_mask], r"$\lambda$"
+    if lambdas.ndim == 2:
+        if not (0 <= traj_idx < lambdas.shape[0]):
+            raise IndexError(
+                f"traj_idx={traj_idx} is out of bounds for {lambdas_key} with {lambdas.shape[0]} trajectories."
+            )
+        if lambdas.shape[1] != valid_mask.shape[0]:
+            raise ValueError(
+                f"Expected {lambdas_key} time dimension to be {valid_mask.shape[0]}, got {lambdas.shape[1]}."
+            )
+        return lambdas[traj_idx, valid_mask], r"$\lambda$"
+
+    raise ValueError(f"Expected {lambdas_key} to have shape (T,) or (n_traj, T), got {lambdas.shape}")
+
+
+def _load_scalar_npz(data, key: str):
+    value = np.asarray(data[key])
+    if value.shape == ():
+        return value.item()
+    return value
+
+
+def _result_from_npz(results_path: str) -> dict:
+    with np.load(results_path, allow_pickle=False) as data:
+        result = {key: np.asarray(data[key]) for key in data.files}
+
+    seed = int(_load_scalar_npz(result, "seed")) if "seed" in result else -1
+    result["cfg"] = SimpleNamespace(seed=seed)
+    result["success"] = True
+    result["results_path"] = results_path
+    return result
+
+
+def load_seed_ablation_results(results_dir: str, architectures: Optional[list[str]] = None) -> dict:
+    """
+    Reconstruct all_seed_results from saved per-seed results.npz files.
+
+    results_dir should be the directory that contains architecture/seed run
+    subdirectories, each with a results.npz file written by run_architectures.py.
+    If a seed_ablation_summary directory is passed, the parent directory is used.
+    """
+    if os.path.basename(os.path.normpath(results_dir)) == "seed_ablation_summary":
+        results_dir = os.path.dirname(os.path.normpath(results_dir))
+
+    if not os.path.isdir(results_dir):
+        raise FileNotFoundError(f"results_dir does not exist: {results_dir}")
+
+    requested = None if architectures is None else set(architectures)
+    all_seed_results = {}
+
+    for entry in sorted(os.listdir(results_dir)):
+        results_path = os.path.join(results_dir, entry, "results.npz")
+        if not os.path.isfile(results_path):
+            continue
+
+        result = _result_from_npz(results_path)
+        if "arch_name" in result:
+            arch_name = str(_load_scalar_npz(result, "arch_name"))
+        else:
+            arch_name = entry.split("__", 1)[0]
+
+        if requested is not None and arch_name not in requested:
+            continue
+
+        all_seed_results.setdefault(arch_name, []).append(result)
+
+    if len(all_seed_results) == 0:
+        raise FileNotFoundError(
+            f"No saved results.npz files found in '{results_dir}'. "
+            "Expected subdirectories like <arch>__...__seed_<n>/results.npz."
+        )
+
+    for arch_name in all_seed_results:
+        all_seed_results[arch_name].sort(key=lambda r: int(r["cfg"].seed))
+
+    return all_seed_results
 
 
 # =========================================================
@@ -333,8 +448,19 @@ def plot_seed_prediction_envelope(
     truth_key = f"{split}_truth"
 
     seeds = np.array([r["cfg"].seed for r in good_results], dtype=int)
-    preds = np.asarray([r[pred_key][traj_idx, :, comp_idx] for r in good_results], dtype=float)
-    truth = np.asarray(good_results[0][truth_key][traj_idx, :, comp_idx], dtype=float)
+    full_truth = np.asarray(good_results[0][truth_key][traj_idx, :, comp_idx], dtype=float)
+    valid_mask = _trajectory_valid_mask(
+        good_results[0],
+        split=split,
+        traj_idx=traj_idx,
+        length=full_truth.shape[0],
+    )
+    preds = np.asarray(
+        [np.asarray(r[pred_key][traj_idx, :, comp_idx], dtype=float)[valid_mask] for r in good_results],
+        dtype=float,
+    )
+    truth = full_truth[valid_mask]
+    x_plot, xlabel = _trajectory_lambda_axis(good_results[0], split, traj_idx, valid_mask)
 
     final_valid = np.asarray([r["valid_hist"][-1] for r in good_results], dtype=float)
     best_idx = int(np.argmin(final_valid))
@@ -348,13 +474,13 @@ def plot_seed_prediction_envelope(
 
     fig, ax = plt.subplots(figsize=(8.2, 5.2))
 
-    ax.fill_between(np.arange(preds.shape[1]), q05, q95, alpha=0.18, label="5-95%")
-    ax.fill_between(np.arange(preds.shape[1]), q25, q75, alpha=0.28, label="25-75%")
-    ax.plot(q50, linestyle="--", linewidth=2.0, label="Median across seeds")
-    ax.plot(preds[best_idx], linewidth=2.6, label=f"Best seed = {best_seed}")
-    ax.plot(truth, color="black", linewidth=2.3, label="Ground truth")
+    ax.fill_between(x_plot, q05, q95, alpha=0.18, label="5-95%")
+    ax.fill_between(x_plot, q25, q75, alpha=0.28, label="25-75%")
+    ax.plot(x_plot, q50, linestyle="--", linewidth=2.0, label="Median across seeds")
+    ax.plot(x_plot, preds[best_idx], linewidth=2.6, label=f"Best seed = {best_seed}")
+    ax.plot(x_plot, truth, color="black", linewidth=2.3, label="Ground truth")
 
-    ax.set_xlabel("lambda index")
+    ax.set_xlabel(xlabel)
     ax.set_ylabel(f"{component}-component position (m)")
     ax.set_title(
         title if title is not None else
@@ -402,8 +528,19 @@ def plot_seed_prediction_all_curves(
     truth_key = f"{split}_truth"
 
     seeds = np.array([r["cfg"].seed for r in good_results], dtype=int)
-    preds = np.asarray([r[pred_key][traj_idx, :, comp_idx] for r in good_results], dtype=float)
-    truth = np.asarray(good_results[0][truth_key][traj_idx, :, comp_idx], dtype=float)
+    full_truth = np.asarray(good_results[0][truth_key][traj_idx, :, comp_idx], dtype=float)
+    valid_mask = _trajectory_valid_mask(
+        good_results[0],
+        split=split,
+        traj_idx=traj_idx,
+        length=full_truth.shape[0],
+    )
+    preds = np.asarray(
+        [np.asarray(r[pred_key][traj_idx, :, comp_idx], dtype=float)[valid_mask] for r in good_results],
+        dtype=float,
+    )
+    truth = full_truth[valid_mask]
+    x_plot, xlabel = _trajectory_lambda_axis(good_results[0], split, traj_idx, valid_mask)
 
     final_valid = np.asarray([r["valid_hist"][-1] for r in good_results], dtype=float)
     best_idx = int(np.argmin(final_valid))
@@ -412,16 +549,17 @@ def plot_seed_prediction_all_curves(
     fig, ax = plt.subplots(figsize=(8.2, 5.2))
 
     for i in range(preds.shape[0]):
-        ax.plot(preds[i], linewidth=1.0, alpha=0.18)
+        ax.plot(x_plot, preds[i], linewidth=1.0, alpha=0.18)
 
     ax.plot(
+        x_plot,
         preds[best_idx],
         linewidth=2.8,
         label=f"Best seed = {best_seed} (test MSE = {final_valid[best_idx]:.3e})",
     )
-    ax.plot(truth, color="black", linewidth=2.3, label="Ground truth")
+    ax.plot(x_plot, truth, color="black", linewidth=2.3, label="Ground truth")
 
-    ax.set_xlabel("lambda index")
+    ax.set_xlabel(xlabel)
     ax.set_ylabel(f"{component}-component position (m)")
     ax.set_title(
         title if title is not None else
@@ -429,6 +567,110 @@ def plot_seed_prediction_all_curves(
     )
     ax.grid(True, alpha=0.25)
     ax.legend()
+    fig.tight_layout()
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def plot_seed_prediction_xz_envelope(
+    seed_results: list[dict],
+    split: str = "valid",
+    traj_idx: int = 0,
+    save_path: Optional[str] = None,
+    title: Optional[str] = None,
+    show: bool = False,
+    x_idx: int = 4,
+    z_idx: int = 6,
+):
+    """
+    x-z phase-space trajectory envelope across seeds.
+    """
+    if split not in ("train", "valid"):
+        raise ValueError("split must be 'train' or 'valid'")
+
+    good_results = _successful_results(seed_results)
+    if len(good_results) == 0:
+        print(f"[plot_seed_prediction_xz_envelope] No successful runs available. Skipping plot.")
+        return
+
+    pred_key = f"{split}_pred"
+    truth_key = f"{split}_truth"
+
+    truth_full = np.asarray(good_results[0][truth_key][traj_idx], dtype=float)
+    valid_mask = _trajectory_valid_mask(
+        good_results[0],
+        split=split,
+        traj_idx=traj_idx,
+        length=truth_full.shape[0],
+    )
+
+    preds_x = np.asarray(
+        [np.asarray(r[pred_key][traj_idx, :, x_idx], dtype=float)[valid_mask] for r in good_results],
+        dtype=float,
+    )
+    preds_z = np.asarray(
+        [np.asarray(r[pred_key][traj_idx, :, z_idx], dtype=float)[valid_mask] for r in good_results],
+        dtype=float,
+    )
+    truth_x = truth_full[valid_mask, x_idx]
+    truth_z = truth_full[valid_mask, z_idx]
+
+    seeds = np.array([r["cfg"].seed for r in good_results], dtype=int)
+    final_valid = np.asarray([r["valid_hist"][-1] for r in good_results], dtype=float)
+    best_idx = int(np.argmin(final_valid))
+    best_seed = int(seeds[best_idx])
+
+    q05_x, q25_x, q50_x, q75_x, q95_x = np.percentile(preds_x, [5, 25, 50, 75, 95], axis=0)
+    q05_z, q25_z, q50_z, q75_z, q95_z = np.percentile(preds_z, [5, 25, 50, 75, 95], axis=0)
+
+    fig, ax = plt.subplots(figsize=(6.2, 5.6))
+
+    stride = max(1, truth_x.shape[0] // 35)
+    for i in range(0, truth_x.shape[0], stride):
+        ax.fill(
+            [q05_x[i], q95_x[i], q95_x[i], q05_x[i]],
+            [q05_z[i], q05_z[i], q95_z[i], q95_z[i]],
+            alpha=0.06,
+            color="C0",
+            linewidth=0,
+        )
+        ax.fill(
+            [q25_x[i], q75_x[i], q75_x[i], q25_x[i]],
+            [q25_z[i], q25_z[i], q75_z[i], q75_z[i]],
+            alpha=0.10,
+            color="C0",
+            linewidth=0,
+        )
+
+    ax.plot(q50_x, q50_z, linestyle="--", linewidth=2.0, color="C0", label="Median across seeds")
+    ax.plot(
+        preds_x[best_idx],
+        preds_z[best_idx],
+        linewidth=2.6,
+        color="C1",
+        label=f"Best seed = {best_seed} (test MSE = {final_valid[best_idx]:.3e})",
+    )
+    ax.plot(truth_x, truth_z, color="black", linewidth=2.3, label="Ground truth")
+
+    q95_handle = mlines.Line2D([], [], color="C0", linewidth=8, alpha=0.12, label="5-95% x-z envelope")
+    q50_handle = mlines.Line2D([], [], color="C0", linewidth=8, alpha=0.22, label="25-75% x-z envelope")
+    handles, labels = ax.get_legend_handles_labels()
+
+    ax.set_xlabel("x-component position (m)")
+    ax.set_ylabel("z-component position (m)")
+    ax.set_title(
+        title if title is not None else
+        f"{split.capitalize()} x-z envelope across seeds | traj {traj_idx}"
+    )
+    ax.grid(True, alpha=0.25)
+    ax.legend(handles=[q95_handle, q50_handle] + handles, labels=[q95_handle.get_label(), q50_handle.get_label()] + labels)
+    ax.set_aspect("equal", adjustable="datalim")
     fig.tight_layout()
 
     if save_path is not None:
@@ -494,12 +736,35 @@ def plot_seed_final_loss_bar(
 # 4) Make all standard plots
 # =========================================================
 def make_seed_ablation_plots(
-    all_seed_results: dict,
-    output_dir: str,
+    all_seed_results: Optional[dict] = None,
+    output_dir: Optional[str] = None,
+    results_dir: Optional[str] = None,
+    architectures: Optional[list[str]] = None,
     traj_idx: int = 0,
     x_idx: int = 4,
     z_idx: int = 6,
 ):
+    if isinstance(all_seed_results, (str, bytes, os.PathLike)):
+        if results_dir is not None:
+            raise ValueError("Pass saved results directory either as first argument or results_dir, not both.")
+        results_dir = all_seed_results
+        all_seed_results = None
+
+    if all_seed_results is None:
+        if results_dir is None:
+            if output_dir is None:
+                raise ValueError("Provide either all_seed_results or results_dir.")
+            if os.path.basename(os.path.normpath(output_dir)) == "seed_ablation_summary":
+                results_dir = os.path.dirname(os.path.normpath(output_dir))
+            else:
+                results_dir = output_dir
+        all_seed_results = load_seed_ablation_results(results_dir, architectures=architectures)
+
+        if output_dir is None or os.path.normpath(output_dir) == os.path.normpath(results_dir):
+            output_dir = os.path.join(results_dir, "seed_ablation_summary")
+    elif output_dir is None:
+        raise ValueError("output_dir must be provided when plotting from in-memory all_seed_results.")
+
     os.makedirs(output_dir, exist_ok=True)
 
     for arch_name, seed_results in all_seed_results.items():
@@ -546,6 +811,17 @@ def make_seed_ablation_plots(
                 title=f"{arch_name} | valid all-seed curves | {component} | traj {traj_idx}",
                 show=False,
             )
+
+        plot_seed_prediction_xz_envelope(
+            seed_results,
+            split="valid",
+            traj_idx=traj_idx,
+            x_idx=x_idx,
+            z_idx=z_idx,
+            save_path=os.path.join(arch_dir, "valid_xz_envelope.png"),
+            title=f"{arch_name} | valid x-z envelope | traj {traj_idx}",
+            show=False,
+        )
 
     plot_seed_final_loss_bar(
         all_seed_results,

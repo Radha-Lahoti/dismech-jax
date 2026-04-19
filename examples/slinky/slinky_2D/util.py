@@ -226,6 +226,7 @@ def train_model(
     snapshot_every=None,
     snapshot_epochs=None,
     snapshot_before_training=False,
+    epoch_callback=None,
     valid_every=1,
     max_dlambda=5e-3,
     iters=5,
@@ -304,6 +305,14 @@ def train_model(
             val_loss=jnp.nan,
         )
 
+    if epoch_callback is not None:
+        epoch_callback(
+            model=model,
+            epoch=-1,
+            train_loss=jnp.nan,
+            val_loss=jnp.nan,
+        )
+
     for i in range(n_epochs):
         model, opt_state, train_loss = step(model, opt_state)
         train_hist.append(train_loss)
@@ -350,6 +359,14 @@ def train_model(
                 aux=aux,
                 train=train,
                 valid=valid,
+                train_loss=train_loss,
+                val_loss=last_val_loss,
+            )
+
+        if epoch_callback is not None:
+            epoch_callback(
+                model=model,
+                epoch=i,
                 train_loss=train_loss,
                 val_loss=last_val_loss,
             )

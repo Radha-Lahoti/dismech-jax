@@ -7,9 +7,11 @@ import numpy as np
 
 import jax
 import jax.numpy as jnp
+import equinox as eqx
 
 from util import Dataset, get_slinky, predict, train_model
 from architecture_plots import (
+    plot_baseline_stiffness_history,
     plot_loss_curves,
     plot_prediction_vs_truth,
     plot_prediction_vs_truth_separate_components,
@@ -148,6 +150,7 @@ class SweepConfig:
 
     output_dir: str = "arch_sweep_outputs"
     save_npz: bool = True
+    save_model: bool = True
     save_plots: bool = True
     verbose: bool = True
     seed_list: tuple[int, ...] = (0, 1, 2, 3, 4)
@@ -290,6 +293,53 @@ def _build_energy_snapshot_controls(cfg: SweepConfig, exp_dir: str):
     return snapshot_fn, snapshot_epochs, cfg.energy_snapshot_initial
 
 
+def _supports_baseline_stiffness_history(model_or_cls) -> bool:
+    supported_types = (
+        DiagonalPlusEnergyNN,
+        CholeskyPlusEnergyNN,
+        DiagonalPlusStiffnessNN,
+        CholeskyPlusStiffnessNN,
+    )
+    if isinstance(model_or_cls, type):
+        return issubclass(model_or_cls, supported_types)
+    return isinstance(model_or_cls, supported_types)
+
+
+def _baseline_stiffness_labels(model_or_cls) -> tuple[str, ...]:
+    if model_or_cls in (DiagonalPlusEnergyNN, DiagonalPlusStiffnessNN) or isinstance(
+        model_or_cls, (DiagonalPlusEnergyNN, DiagonalPlusStiffnessNN)
+    ):
+        return ("k_s", "k_b")
+    if model_or_cls in (CholeskyPlusEnergyNN, CholeskyPlusStiffnessNN) or isinstance(
+        model_or_cls, (CholeskyPlusEnergyNN, CholeskyPlusStiffnessNN)
+    ):
+        return ("k_ss", "k_sb", "k_bb")
+    raise ValueError(f"Unsupported model type for baseline stiffness labels: {model_or_cls}")
+
+
+def _extract_baseline_stiffness_entries(model) -> Optional[np.ndarray]:
+    if not _supports_baseline_stiffness_history(model):
+        return None
+    return np.asarray(model.get_baseline_K_entries(), dtype=float)
+
+
+def _make_baseline_history_callback(model_cls):
+    history_epochs = []
+    history_values = []
+
+    def callback(model, epoch, train_loss=None, val_loss=None):
+        _ = train_loss, val_loss
+        values = _extract_baseline_stiffness_entries(model)
+        if values is None:
+            return
+        history_epochs.append(int(epoch))
+        history_values.append(values)
+
+    labels = _baseline_stiffness_labels(model_cls) if _supports_baseline_stiffness_history(model_cls) else ()
+
+    return callback, history_epochs, history_values, labels
+
+
 # =========================================================
 # 4) Saving helpers
 # =========================================================
@@ -317,9 +367,11 @@ def save_results_npz(
     valid_lambdas,
     train_valid_mask,
     valid_valid_mask,
+    baseline_history_epochs=None,
+    baseline_history_values=None,
+    baseline_history_labels=None,
 ):
-    np.savez(
-        os.path.join(exp_dir, "results.npz"),
+    save_dict = dict(
         arch_name=spec.name,
         model_cls=spec.model_cls.__name__,
         which_case=spec.which_case,
@@ -348,6 +400,17 @@ def save_results_npz(
         train_valid_mask=np.asarray(train_valid_mask, dtype=bool),
         valid_valid_mask=np.asarray(valid_valid_mask, dtype=bool),
     )
+    if baseline_history_epochs is not None and baseline_history_values is not None:
+        save_dict["baseline_history_epochs"] = np.asarray(baseline_history_epochs, dtype=int)
+        save_dict["baseline_history_values"] = np.asarray(baseline_history_values, dtype=float)
+    if baseline_history_labels is not None and len(baseline_history_labels) > 0:
+        save_dict["baseline_history_labels"] = np.asarray(baseline_history_labels, dtype=str)
+
+    np.savez(os.path.join(exp_dir, "results.npz"), **save_dict)
+
+
+def save_model_artifact(exp_dir: str, model):
+    eqx.tree_serialise_leaves(os.path.join(exp_dir, "model.eqx"), model)
 
 
 # =========================================================
@@ -389,6 +452,22 @@ def run_one_architecture(
     snapshot_fn, snapshot_epochs, snapshot_before_training = _build_energy_snapshot_controls(
         cfg, exp_dir
     )
+    baseline_callback = None
+    baseline_history_epochs = None
+    baseline_history_values = None
+    baseline_history_labels = ()
+    if spec.model_cls in (
+        DiagonalPlusEnergyNN,
+        CholeskyPlusEnergyNN,
+        DiagonalPlusStiffnessNN,
+        CholeskyPlusStiffnessNN,
+    ):
+        (
+            baseline_callback,
+            baseline_history_epochs,
+            baseline_history_values,
+            baseline_history_labels,
+        ) = _make_baseline_history_callback(spec.model_cls)
 
     try:
         # -------------------------
@@ -406,6 +485,7 @@ def run_one_architecture(
             snapshot_every=cfg.energy_snapshot_every,
             snapshot_epochs=snapshot_epochs,
             snapshot_before_training=snapshot_before_training,
+            epoch_callback=baseline_callback,
             valid_every=cfg.valid_every,
             max_dlambda=cfg.max_dlambda,
             iters=cfg.iters,
@@ -448,6 +528,9 @@ def run_one_architecture(
         # -------------------------
         save_config_json(cfg, spec, exp_dir)
 
+        if cfg.save_model:
+            save_model_artifact(exp_dir, model)
+
         if cfg.save_npz:
             save_results_npz(
                 exp_dir=exp_dir,
@@ -463,6 +546,9 @@ def run_one_architecture(
                 valid_lambdas=valid_data.lambdas,
                 train_valid_mask=train_data.valid,
                 valid_valid_mask=valid_data.valid,
+                baseline_history_epochs=baseline_history_epochs,
+                baseline_history_values=baseline_history_values,
+                baseline_history_labels=baseline_history_labels,
             )
 
         # -------------------------
@@ -516,6 +602,16 @@ def run_one_architecture(
                 show=False,
             )
 
+            if baseline_history_values is not None and len(baseline_history_values) > 0:
+                plot_baseline_stiffness_history(
+                    epochs=baseline_history_epochs,
+                    values=baseline_history_values,
+                    labels=baseline_history_labels,
+                    title=f"{title} | baseline stiffness",
+                    save_path=os.path.join(exp_dir, "baseline_stiffness_history.png"),
+                    show=False,
+                )
+
         result = {
             "spec": spec,
             "cfg": cfg,
@@ -531,6 +627,9 @@ def run_one_architecture(
             "valid_lambdas": np.asarray(valid_data.lambdas),
             "train_valid_mask": np.asarray(train_data.valid),
             "valid_valid_mask": np.asarray(valid_data.valid),
+            "baseline_history_epochs": None if baseline_history_epochs is None else np.asarray(baseline_history_epochs, dtype=int),
+            "baseline_history_values": None if baseline_history_values is None else np.asarray(baseline_history_values, dtype=float),
+            "baseline_history_labels": baseline_history_labels,
             "exp_dir": exp_dir,
             "exp_name": experiment_name(spec, cfg),
             "success": True,

@@ -28,7 +28,7 @@ class SlinkyN3Properties(Properties):
     density: float = 1200.0
     E: float = 1e6
     N: int = 3
-    mass: float = 0.3
+    mass: float = 0.05
 
 @dataclass
 class SlinkyN5Properties(Properties):
@@ -49,8 +49,16 @@ class StripN9Properties(Properties):
 
 @dataclass
 class TubeN7Properties(Properties):
-    length: float = 0.45
+    length: float = 0.5
     r0: float = 0.005
-    density: float = 700.0
+    density: float = 600.0
+    E: float = 1e6
+    N: int = 7
+
+@dataclass
+class TapeN7Properties(Properties):
+    length: float = 0.7
+    r0: float = 0.005
+    density: float = 600.0
     E: float = 1e6
     N: int = 7
