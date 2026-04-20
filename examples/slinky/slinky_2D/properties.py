@@ -25,10 +25,10 @@ class Properties:
 class SlinkyN3Properties(Properties):
     length: float = 0.20
     r0: float = 0.005
-    density: float = 1200.0
+    density: float = 800.0
     E: float = 1e6
     N: int = 3
-    mass: float = 0.05
+    mass: float = 0.3
 
 @dataclass
 class SlinkyN5Properties(Properties):
