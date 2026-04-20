@@ -510,7 +510,8 @@ def run_one_architecture(
             ls_steps=cfg.ls_steps,
             abs_tol=cfg.abs_tol,
             rel_tol=cfg.rel_tol,
-            fail_on_nonconvergence=cfg.fail_on_nonconvergence,
+            # fail_on_nonconvergence=cfg.fail_on_nonconvergence,
+            fail_on_nonconvergence=False,  # override to get predictions even if some trajectories fail
         )
         valid_pred = predict(
             model, base, aux,
@@ -520,7 +521,8 @@ def run_one_architecture(
             ls_steps=cfg.ls_steps,
             abs_tol=cfg.abs_tol,
             rel_tol=cfg.rel_tol,
-            fail_on_nonconvergence=cfg.fail_on_nonconvergence,
+            # fail_on_nonconvergence=cfg.fail_on_nonconvergence,
+            fail_on_nonconvergence=False,  # override to get predictions even if some trajectories fail
         )
 
         # -------------------------
