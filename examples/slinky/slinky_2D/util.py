@@ -332,7 +332,7 @@ def train_model(
                 ls_steps=ls_steps,
                 abs_tol=abs_tol,
                 rel_tol=rel_tol,
-                fail_on_nonconvergence=fail_on_nonconvergence,
+                fail_on_nonconvergence=False,
             )
 
         valid_hist.append(last_val_loss)

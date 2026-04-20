@@ -30,11 +30,50 @@ def compute_ift_gradient(
     sys: System,
 ) -> eqx.Module:
     H = sys.get_H(_lambda, q_star, model, aux)
-    H_reg = H.at[jnp.diag_indices(H.shape[0])].add(1e-8)
+    H = 0.5 * (H + H.T)
+    diag_scale = jnp.maximum(jnp.mean(jnp.abs(jnp.diag(H))), 1.0)
+    H_reg = H.at[jnp.diag_indices(H.shape[0])].add(1e-8 * diag_scale)
     v = jnp.linalg.solve(H_reg, grad_obj)
     _, vjp_fn = jax.vjp(lambda _m: sys.get_F(_lambda, q_star, _m, aux), model)
     (grads,) = vjp_fn(-v)
     return grads
+
+
+def _descent_newton_direction(H: jax.Array, res: jax.Array) -> tuple[jax.Array, jax.Array]:
+    H = 0.5 * (H + H.T)
+    diag_idx = jnp.diag_indices(H.shape[0])
+    diag_scale = jnp.maximum(jnp.mean(jnp.abs(jnp.diag(H))), 1.0)
+    res_sq = jnp.dot(res, res)
+
+    def is_descent(delta, slope):
+        return jnp.logical_and(
+            jnp.all(jnp.isfinite(delta)),
+            jnp.logical_and(jnp.isfinite(slope), slope > 0.0),
+        )
+
+    H_newton = H.at[diag_idx].add(1e-8 * diag_scale)
+    delta_newton = jnp.linalg.solve(H_newton, res)
+    slope_newton = jnp.dot(res, delta_newton)
+    use_newton = is_descent(delta_newton, slope_newton)
+
+    def damped_or_steepest(_):
+        H_damped = H.at[diag_idx].add(1e-3 * diag_scale)
+        delta_damped = jnp.linalg.solve(H_damped, res)
+        slope_damped = jnp.dot(res, delta_damped)
+        use_damped = is_descent(delta_damped, slope_damped)
+
+        delta_steepest = res / diag_scale
+        slope_steepest = res_sq / diag_scale
+        delta = jnp.where(use_damped, delta_damped, delta_steepest)
+        slope = jnp.where(use_damped, slope_damped, slope_steepest)
+        return delta, slope
+
+    return jax.lax.cond(
+        use_newton,
+        lambda _: (delta_newton, slope_newton),
+        damped_or_steepest,
+        operand=None,
+    )
 
 
 @eqx.filter_custom_vjp
@@ -53,14 +92,15 @@ def solve_step(
     fail_on_nonconvergence: bool = False,
 ) -> jax.Array:
     """
-    Fixed-length Newton solve for one continuation/load step.
+    Fixed-length damped Newton solve for one continuation/load step.
 
-    Added minimal convergence check:
+    Includes:
+      - symmetrized Hessian
+      - conditional damping/fallback when Newton is not a descent direction
+      - energy line search that never accepts a higher-energy step if Armijo fails
       - absolute residual tolerance
       - relative residual reduction tolerance
       - optional hard failure via eqx.error_if
-
-    This does NOT change the number of Newton iterations.
     """
     alphas = 0.5 ** jnp.arange(ls_steps)
 
@@ -70,11 +110,8 @@ def solve_step(
     def newton_step(carry, _):
         q, aux_cur, e_old, res = carry
 
-        # Newton system
         H = sys.get_H(_lambda, q, model, aux_cur)
-        H_reg = H.at[jnp.diag_indices(H.shape[0])].add(1e-8)
-        delta_q = jnp.linalg.solve(H_reg, res)
-        slope = jnp.dot(res, delta_q)
+        delta_q, slope = _descent_newton_direction(H, res)
 
         # Parallel line search
         test_qs = q + alphas[:, None] * delta_q
@@ -84,11 +121,19 @@ def solve_step(
         # Armijo therefore uses a decrease bound with a minus sign here.
         is_good = test_energies <= e_old - c1 * alphas * slope
 
-        # If Armijo fails, take the smallest possible step
-        safe_idx = jnp.where(jnp.any(is_good), jnp.argmax(is_good), ls_steps - 1)
+        # If Armijo fails, choose the best finite energy among the current point
+        # and the trial points. This avoids accepting an uphill step.
+        finite_test_energies = jnp.where(jnp.isfinite(test_energies), test_energies, jnp.inf)
+        candidate_energies = jnp.concatenate([e_old[None], finite_test_energies])
+        best_idx = jnp.argmin(candidate_energies)
+        fallback_idx = jnp.maximum(best_idx - 1, 0)
+        armijo_idx = jnp.argmax(is_good)
+        safe_idx = jnp.where(jnp.any(is_good), armijo_idx, fallback_idx)
+        use_current = jnp.logical_and(~jnp.any(is_good), best_idx == 0)
 
-        next_q = test_qs[safe_idx]
-        next_e = test_energies[safe_idx]
+        next_q_trial = test_qs[safe_idx]
+        next_q = jnp.where(use_current, q, next_q_trial)
+        next_e = jnp.where(use_current, e_old, test_energies[safe_idx])
         next_aux = update_aux_state(aux_cur, next_q, sys)
         next_res = -sys.get_F(_lambda, next_q, model, next_aux)
 
@@ -111,7 +156,7 @@ def solve_step(
         final_q = eqx.error_if(
             final_q,
             ~converged,
-            ("Newton solve did not converge. Residual norm: {}", final_res_norm)
+            "Newton solve did not converge."
         )
 
     return final_q
