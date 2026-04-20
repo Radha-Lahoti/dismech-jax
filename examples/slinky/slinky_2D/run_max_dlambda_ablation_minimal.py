@@ -460,8 +460,12 @@ def run_max_dlambda_ablation(
     for arch_name in arch_names:
         spec = registry[arch_name]
         records = []
+        stop_this_architecture = False
 
         for seed in cfg.seed_list:
+            if stop_this_architecture:
+                break
+
             for max_dlambda in cfg.max_dlambda_values:
                 rec = run_one_max_dlambda_case(
                     properties=properties,
@@ -486,6 +490,12 @@ def run_max_dlambda_ablation(
                     )
 
                 if cfg.stop_after_first_failure and not rec["success"]:
+                    stop_this_architecture = True
+                    if cfg.verbose:
+                        print(
+                            f"Stopping larger max_dlambda values for {arch_name} "
+                            "after first failure. Moving to next architecture."
+                        )
                     break
 
         all_results[arch_name] = records
