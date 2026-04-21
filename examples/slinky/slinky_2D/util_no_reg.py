@@ -4,7 +4,6 @@ import equinox as eqx
 import optax
 import numpy as np
 import dismech_jax as djx
-from dismech_jax.solver import update_aux_state
 
 from Energy_NN_architectures import ModelParams
 
@@ -128,51 +127,6 @@ def predict(
     return pred
 
 # =========================================================
-# Hessian regularization
-# =========================================================
-def energy_hessian_spectral_regularizer(
-    model,
-    rod,
-    aux,
-    lambdas,
-    qs,
-    valid,
-    key,
-    n_probes=1,
-):
-    """
-    Hutchinson/Frobenius proxy for the spectral size of the energy Hessian.
-
-    For the Newton solve, the relevant local linear operator is
-        H(q*) = d^2 E / dq^2,
-    evaluated at the solved equilibrium q*. Following the DEQ Jacobian
-    regularizer, we avoid eigendecompositions and use
-        rho(H)^2 <= ||H||_2^2 <= ||H||_F^2
-    with the unbiased Hutchinson estimate
-        ||H||_F^2 = E_v ||H v||^2,  v ~ N(0, I).
-    The division by the DOF count matches the DEQ paper's normalization by d.
-    """
-    keys = jax.random.split(key, qs.shape[0])
-    dof = qs.shape[-1]
-
-    def penalty_one(_lambda, q, is_valid, sample_key):
-        aux_q = update_aux_state(aux, q, rod)
-        H = rod.get_H(_lambda, q, model, aux_q)
-        H = 0.5 * (H + H.T)
-        free_mask = rod.bc.mask(q)
-        H = H * free_mask[:, None] * free_mask[None, :]
-        free_dof = jnp.maximum(jnp.sum(free_mask), 1.0)
-
-        probes = jax.random.normal(sample_key, (n_probes, dof), dtype=q.dtype)
-        h_probes = jax.vmap(lambda v: H @ v)(probes)
-        estimate = jnp.mean(jnp.sum(h_probes**2, axis=-1)) / free_dof
-        return jnp.where(is_valid, estimate, 0.0)
-
-    penalties = jax.vmap(penalty_one)(lambdas, qs, valid, keys)
-    return jnp.sum(penalties) / jnp.maximum(jnp.sum(valid), 1.0)
-
-
-# =========================================================
 # Loss (MSE over trajectories)
 # =========================================================
 def traj_loss(
@@ -190,9 +144,6 @@ def traj_loss(
     abs_tol=1e-8,
     rel_tol=1e-6,
     fail_on_nonconvergence=False,
-    hessian_reg_strength=0.0,
-    hessian_reg_key=None,
-    hessian_reg_probes=1,
 ):
     bc = djx.DirectBC(idx_b=idx_b, xb=xb, lambdas=lambdas)
     rod = base.with_bc(bc)
@@ -210,22 +161,7 @@ def traj_loss(
     )
     err = (qs_pred - qs_true) ** 2
     masked_err = jnp.where(valid[..., None], err, 0.0)
-    mse = jnp.sum(masked_err) / jnp.sum(valid)
-
-    if hessian_reg_strength == 0.0:
-        return mse
-
-    hessian_reg = energy_hessian_spectral_regularizer(
-        model,
-        rod,
-        aux,
-        lambdas,
-        qs_pred,
-        valid,
-        hessian_reg_key,
-        n_probes=hessian_reg_probes,
-    )
-    return mse + hessian_reg_strength * hessian_reg
+    return jnp.sum(masked_err) / jnp.sum(valid)
 
 
 def dataset_loss(
@@ -239,9 +175,6 @@ def dataset_loss(
     abs_tol=1e-8,
     rel_tol=1e-6,
     fail_on_nonconvergence=False,
-    hessian_reg_strength=0.0,
-    hessian_reg_key=None,
-    hessian_reg_probes=1,
 ):
     n_traj = data.qs.shape[0]
 
@@ -257,12 +190,8 @@ def dataset_loss(
     else:
         lam_all = data.lambdas
 
-    if hessian_reg_key is None:
-        hessian_reg_key = jax.random.PRNGKey(0)
-    reg_keys = jax.random.split(hessian_reg_key, n_traj)
-
     losses = jax.vmap(
-        lambda ib, xb, qs, lam, valid, reg_key: traj_loss(
+        lambda ib, xb, qs, lam, valid: traj_loss(
             model,
             base,
             aux,
@@ -277,11 +206,8 @@ def dataset_loss(
             abs_tol=abs_tol,
             rel_tol=rel_tol,
             fail_on_nonconvergence=fail_on_nonconvergence,
-            hessian_reg_strength=hessian_reg_strength,
-            hessian_reg_key=reg_key,
-            hessian_reg_probes=hessian_reg_probes,
         )
-    )(idx_all, data.xb, data.qs, lam_all, data.valid, reg_keys)
+    )(idx_all, data.xb, data.qs, lam_all, data.valid)
 
     return jnp.mean(losses)
 
@@ -308,9 +234,6 @@ def train_model(
     abs_tol=1e-8,
     rel_tol=1e-6,
     fail_on_nonconvergence=False,
-    hessian_reg_strength=0.0,
-    hessian_reg_probes=1,
-    hessian_reg_seed=0,
 ):
     # --- setup ---
     base, aux = get_slinky(properties)
@@ -340,11 +263,10 @@ def train_model(
     # )
 
     opt_state = opt.init(model)
-    hessian_reg_key = jax.random.PRNGKey(hessian_reg_seed)
 
     # --- training step ---
     @eqx.filter_jit
-    def step(model, opt_state, reg_key):
+    def step(model, opt_state):
         loss, grads = eqx.filter_value_and_grad(
             lambda m: dataset_loss(
                 m,
@@ -357,9 +279,6 @@ def train_model(
                 abs_tol=abs_tol,
                 rel_tol=rel_tol,
                 fail_on_nonconvergence=fail_on_nonconvergence,
-                hessian_reg_strength=hessian_reg_strength,
-                hessian_reg_key=reg_key,
-                hessian_reg_probes=hessian_reg_probes,
             )
         )(model)
 
@@ -395,8 +314,7 @@ def train_model(
         )
 
     for i in range(n_epochs):
-        hessian_reg_key, step_reg_key = jax.random.split(hessian_reg_key)
-        model, opt_state, train_loss = step(model, opt_state, step_reg_key)
+        model, opt_state, train_loss = step(model, opt_state)
         train_hist.append(train_loss)
 
         do_valid = (valid_every is not None) and (
