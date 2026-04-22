@@ -28,7 +28,7 @@ class SlinkyN3Properties(Properties):
     density: float = 800.0
     E: float = 1e6
     N: int = 3
-    mass: float = 0.3
+    mass: float = 0.05
 
 @dataclass
 class SlinkyN5Properties(Properties):

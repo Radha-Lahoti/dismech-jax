@@ -6,6 +6,17 @@ from .states import State
 from .systems import System
 
 
+# Solver-local debugging switch. Keep this internal so rod/training call sites do
+# not grow another option; flip to False here when inspecting raw Hessians.
+SYMMETRIZE_HESSIAN = True
+
+
+def _maybe_symmetrize_hessian(H: jax.Array) -> jax.Array:
+    if SYMMETRIZE_HESSIAN:
+        return 0.5 * (H + H.T)
+    return H
+
+
 def update_aux_state(
     aux: State,
     q: jax.Array,
@@ -30,7 +41,7 @@ def compute_ift_gradient(
     sys: System,
 ) -> eqx.Module:
     H = sys.get_H(_lambda, q_star, model, aux)
-    H = 0.5 * (H + H.T)
+    H = _maybe_symmetrize_hessian(H)
     diag_scale = jnp.maximum(jnp.mean(jnp.abs(jnp.diag(H))), 1.0)
     H_reg = H.at[jnp.diag_indices(H.shape[0])].add(1e-8 * diag_scale)
     v = jnp.linalg.solve(H_reg, grad_obj)
@@ -40,7 +51,7 @@ def compute_ift_gradient(
 
 
 def _descent_newton_direction(H: jax.Array, res: jax.Array) -> tuple[jax.Array, jax.Array]:
-    H = 0.5 * (H + H.T)
+    H = _maybe_symmetrize_hessian(H)
     diag_idx = jnp.diag_indices(H.shape[0])
     diag_scale = jnp.maximum(jnp.mean(jnp.abs(jnp.diag(H))), 1.0)
     res_sq = jnp.dot(res, res)
@@ -95,7 +106,7 @@ def solve_step(
     Fixed-length damped Newton solve for one continuation/load step.
 
     Includes:
-      - symmetrized Hessian
+      - optional solver-local Hessian symmetrization via SYMMETRIZE_HESSIAN
       - conditional damping/fallback when Newton is not a descent direction
       - energy line search that never accepts a higher-energy step if Armijo fails
       - absolute residual tolerance
@@ -151,12 +162,14 @@ def solve_step(
     rel_res_norm = final_res_norm / jnp.maximum(init_res_norm, 1e-16)
 
     converged = jnp.logical_or(final_res_norm < abs_tol, rel_res_norm < rel_tol)
-
+    
     if fail_on_nonconvergence:
+        # jax.debug.print("Newton solve: final residual norm = {final_res_norm:.3e}",
+            # final_res_norm=final_res_norm)
         final_q = eqx.error_if(
             final_q,
             ~converged,
-            "Newton solve did not converge."
+            "Newton solve did not converge"
         )
 
     return final_q
@@ -291,7 +304,7 @@ def solve_fwd(
         final_q, final_aux, final_L = jax.lax.while_loop(
             cond_fn, body_fn, (_q, _aux, _current_lambda)
         )
-        return (final_q, final_aux, final_L), (final_q, _aux)
+        return (final_q, final_aux, final_L), (final_q, final_aux)
 
     q_start = solve_step(
         model, lambdas[0], q0, aux, sys,

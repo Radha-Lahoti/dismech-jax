@@ -144,9 +144,19 @@ class SweepConfig:
     max_dlambda: float = 1e-2
     iters: int = 5
     ls_steps: int = 10
-    abs_tol: float = 1e-8
-    rel_tol: float = 1e-6
-    fail_on_nonconvergence: bool = False
+    abs_tol: float = 1e-4
+    rel_tol: float = 1e-4
+    # Keep strict convergence checks during optimizer steps, while validation
+    # loss inside util.train_model remains non-strict and prediction is
+    # controlled separately below.
+    train_fail_on_nonconvergence: bool = True
+    prediction_fail_on_nonconvergence: bool = False
+    fail_on_nonconvergence: Optional[bool] = None  # legacy alias for training
+
+    # Optional Hessian spectral regularizer in util.py.
+    hessian_reg_strength: float = 0.0
+    hessian_reg_probes: int = 1
+    hessian_reg_seed: int = 0
 
     output_dir: str = "arch_sweep_outputs"
     save_npz: bool = True
@@ -225,7 +235,7 @@ def make_model_params(cfg: SweepConfig, spec: ArchSpec) -> ModelParams:
 def experiment_name(spec: ArchSpec, cfg: SweepConfig) -> str:
     hidden_str = "x".join(str(h) for h in cfg.hidden)
     zr = "zr1" if cfg.zero_reference else "zr0"
-    return (
+    name = (
         f"{spec.name}"
         f"__hid_{hidden_str}"
         f"__inp_{cfg.input_mode}"
@@ -236,6 +246,13 @@ def experiment_name(spec: ArchSpec, cfg: SweepConfig) -> str:
         f"__mdl_{cfg.max_dlambda:g}"
         f"__it_{cfg.iters}"
     )
+    if cfg.hessian_reg_strength != 0.0:
+        name += (
+            f"__hreg_{cfg.hessian_reg_strength:g}"
+            f"__hprobe_{cfg.hessian_reg_probes}"
+            f"__hseed_{cfg.hessian_reg_seed}"
+        )
+    return name
 
 
 def make_experiment_dir(spec: ArchSpec, cfg: SweepConfig) -> str:
@@ -253,6 +270,12 @@ def _classify_exception_message(msg: str) -> str:
     if "inf" in msg_low:
         return "inf_exception"
     return f"exception: {msg}"
+
+
+def _train_fail_on_nonconvergence(cfg: SweepConfig) -> bool:
+    if cfg.fail_on_nonconvergence is not None:
+        return bool(cfg.fail_on_nonconvergence)
+    return bool(cfg.train_fail_on_nonconvergence)
 
 
 def _build_energy_snapshot_controls(cfg: SweepConfig, exp_dir: str):
@@ -348,6 +371,8 @@ def save_config_json(cfg: SweepConfig, spec: ArchSpec, exp_dir: str):
     payload["arch_name"] = spec.name
     payload["model_cls"] = spec.model_cls.__name__
     payload["which_case"] = spec.which_case
+    payload["effective_train_fail_on_nonconvergence"] = _train_fail_on_nonconvergence(cfg)
+    payload["validation_loss_fail_on_nonconvergence"] = False
 
     with open(os.path.join(exp_dir, "config.json"), "w") as f:
         json.dump(payload, f, indent=2)
@@ -388,7 +413,13 @@ def save_results_npz(
         ls_steps=int(cfg.ls_steps),
         abs_tol=float(cfg.abs_tol),
         rel_tol=float(cfg.rel_tol),
-        fail_on_nonconvergence=int(cfg.fail_on_nonconvergence),
+        train_fail_on_nonconvergence=int(_train_fail_on_nonconvergence(cfg)),
+        validation_loss_fail_on_nonconvergence=0,
+        prediction_fail_on_nonconvergence=int(cfg.prediction_fail_on_nonconvergence),
+        fail_on_nonconvergence=int(_train_fail_on_nonconvergence(cfg)),
+        hessian_reg_strength=float(cfg.hessian_reg_strength),
+        hessian_reg_probes=int(cfg.hessian_reg_probes),
+        hessian_reg_seed=int(cfg.hessian_reg_seed),
         train_hist=np.asarray(train_hist, dtype=float),
         valid_hist=np.asarray(valid_hist, dtype=float),
         train_pred=np.asarray(train_pred, dtype=float),
@@ -441,7 +472,12 @@ def run_one_architecture(
         print(f"  ls_steps                : {cfg.ls_steps}")
         print(f"  abs_tol                 : {cfg.abs_tol}")
         print(f"  rel_tol                 : {cfg.rel_tol}")
-        print(f"  fail_on_nonconvergence  : {cfg.fail_on_nonconvergence}")
+        print(f"  training fail_on_nonconvergence       : {_train_fail_on_nonconvergence(cfg)}")
+        print("  validation loss fail_on_nonconvergence: False")
+        print(f"  prediction fail_on_nonconvergence     : {cfg.prediction_fail_on_nonconvergence}")
+        print(f"  hessian_reg_strength    : {cfg.hessian_reg_strength}")
+        print(f"  hessian_reg_probes      : {cfg.hessian_reg_probes}")
+        print(f"  hessian_reg_seed        : {cfg.hessian_reg_seed}")
         print(f"  exp_dir                 : {exp_dir}")
         if cfg.save_energy_landscapes:
             print(f"  energy snapshots        : initial={cfg.energy_snapshot_initial}, final={cfg.energy_snapshot_final}, epochs={cfg.energy_snapshot_epochs}, every={cfg.energy_snapshot_every}")
@@ -492,7 +528,10 @@ def run_one_architecture(
             ls_steps=cfg.ls_steps,
             abs_tol=cfg.abs_tol,
             rel_tol=cfg.rel_tol,
-            fail_on_nonconvergence=cfg.fail_on_nonconvergence,
+            fail_on_nonconvergence=_train_fail_on_nonconvergence(cfg),
+            hessian_reg_strength=cfg.hessian_reg_strength,
+            hessian_reg_probes=cfg.hessian_reg_probes,
+            hessian_reg_seed=cfg.hessian_reg_seed,
         )
 
         # -------------------------
@@ -510,8 +549,7 @@ def run_one_architecture(
             ls_steps=cfg.ls_steps,
             abs_tol=cfg.abs_tol,
             rel_tol=cfg.rel_tol,
-            # fail_on_nonconvergence=cfg.fail_on_nonconvergence,
-            fail_on_nonconvergence=False,  # override to get predictions even if some trajectories fail
+            fail_on_nonconvergence=cfg.prediction_fail_on_nonconvergence,
         )
         valid_pred = predict(
             model, base, aux,
@@ -521,8 +559,7 @@ def run_one_architecture(
             ls_steps=cfg.ls_steps,
             abs_tol=cfg.abs_tol,
             rel_tol=cfg.rel_tol,
-            # fail_on_nonconvergence=cfg.fail_on_nonconvergence,
-            fail_on_nonconvergence=False,  # override to get predictions even if some trajectories fail
+            fail_on_nonconvergence=cfg.prediction_fail_on_nonconvergence,
         )
 
         # -------------------------

@@ -175,6 +175,17 @@ def energy_hessian_spectral_regularizer(
 # =========================================================
 # Loss (MSE over trajectories)
 # =========================================================
+def _move_valid_prefix(qs, xb, lambdas, valid):
+    """Move a left-padded valid suffix to the front, repeating the last frame at the tail."""
+    T = valid.shape[0]
+    steps = jnp.arange(T)
+    n_valid = jnp.sum(valid)
+    first_valid = jnp.argmax(valid)
+    src_idx = jnp.minimum(first_valid + steps, T - 1)
+    compact_valid = steps < n_valid
+    return qs[src_idx], xb[src_idx], lambdas[src_idx], compact_valid
+
+
 def traj_loss(
     model,
     base,
@@ -194,6 +205,8 @@ def traj_loss(
     hessian_reg_key=None,
     hessian_reg_probes=1,
 ):
+    qs_true, xb, lambdas, valid = _move_valid_prefix(qs_true, xb, lambdas, valid)
+
     bc = djx.DirectBC(idx_b=idx_b, xb=xb, lambdas=lambdas)
     rod = base.with_bc(bc)
 
@@ -305,8 +318,8 @@ def train_model(
     max_dlambda=5e-3,
     iters=5,
     ls_steps=10,
-    abs_tol=1e-8,
-    rel_tol=1e-6,
+    abs_tol=1e-4,
+    rel_tol=1e-4,
     fail_on_nonconvergence=False,
     hessian_reg_strength=0.0,
     hessian_reg_probes=1,
