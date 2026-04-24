@@ -732,3 +732,213 @@ class CholeskyPlusStiffnessSignedNN(eqx.Module, _CholeskyBase):
     def __call__(self, del_strain: jax.Array) -> jax.Array:
         k_ss, k_sb, k_bb = self.get_K_entries(del_strain)
         return self._chol_energy_from_entries(k_ss, k_sb, k_bb, del_strain)
+
+
+#####################################################################################################################
+## Brazier's effect:
+# ===================================================================================== #
+# 6) StructuredBrazierCholeskyEnergyNN
+#     Full 5-strain energy with explicit Brazier softening in kappa1
+#     del_strain = [eps0, eps1, kappa0, kappa1, tau]
+# ===================================================================================== #
+
+def _vec_to_lower_triangular_5(p: jax.Array) -> jax.Array:
+    """Map 15-vector to 5x5 lower-triangular matrix."""
+    p = jnp.ravel(p)
+    if p.shape != (15,):
+        raise ValueError(f"Expected p shape (15,), got {p.shape}")
+
+    L = jnp.zeros((5, 5))
+    idx = 0
+    for i in range(5):
+        for j in range(i + 1):
+            if i == j:
+                L = L.at[i, j].set(jax.nn.softplus(p[idx]) + 1e-6)
+            else:
+                L = L.at[i, j].set(p[idx])
+            idx += 1
+    return L
+
+
+class StructuredBrazierCholeskyEnergyNN(eqx.Module):
+    """
+    Energy model for strain vector
+
+        del_strain = [eps0, eps1, kappa0, kappa1, tau]
+
+    The kappa1 stiffness softens exponentially after a learned critical curvature.
+    In anisotropic mode, positive and negative bending directions have different
+    thresholds and decay rates. In isotropic mode, they are shared.
+
+    Energy:
+
+        E = 0.5 * eps^T K(eps) eps
+
+    where K(eps) is PSD by construction.
+    """
+
+    # Baseline diagonal stiffness for all 5 strain modes
+    K0_raw: jax.Array          # shape (5,)
+
+    # Minimum retained stiffness ratio for kappa1 mode
+    rho_min_raw: jax.Array     # scalar
+
+    # Critical curvature parameters
+    kappa_c_raw: jax.Array     # shape (2,) anisotropic, shape (1,) isotropic
+
+    # Exponential decay rate parameters
+    alpha_raw: jax.Array       # shape (2,) anisotropic, shape (1,) isotropic
+
+    # Optional small PSD residual correction
+    residual_net: VectorNet
+
+    mode: str = eqx.field(static=True)          # "anisotropic" or "isotropic"
+    which_case: str = eqx.field(static=True)    # "MLP", "ICNN", or "no_residual"
+    corr_factor: float = eqx.field(static=True)
+    activation: str = eqx.field(static=True)
+
+    def __init__(
+        self,
+        params: ModelParams,
+        *,
+        mode: str = "anisotropic",
+        kappa_c_init: float = 1.0,
+        alpha_init: float = 10.0,
+        rho_min_init: float = 0.05,
+    ):
+        if mode not in ("anisotropic", "isotropic"):
+            raise ValueError("mode must be either 'anisotropic' or 'isotropic'.")
+
+        self.mode = mode
+        self.which_case = params.which_case
+        self.corr_factor = params.corr_factor
+        self.activation = params.activation
+
+        der_K = jnp.ravel(params.der_K)
+        if der_K.shape != (5,):
+            raise ValueError(
+                "StructuredBrazierCholeskyEnergyNN expects params.der_K "
+                f"to have shape (5,), got {der_K.shape}."
+            )
+
+        self.K0_raw = inv_softplus(jnp.maximum(der_K, 1e-8))
+
+        self.rho_min_raw = inv_softplus(jnp.array(rho_min_init))
+
+        if mode == "anisotropic":
+            self.kappa_c_raw = inv_softplus(
+                jnp.array([kappa_c_init, kappa_c_init])
+            )
+            self.alpha_raw = inv_softplus(
+                jnp.array([alpha_init, alpha_init])
+            )
+        else:
+            self.kappa_c_raw = inv_softplus(jnp.array([kappa_c_init]))
+            self.alpha_raw = inv_softplus(jnp.array([alpha_init]))
+
+        # NN sees the full 5D strain vector and outputs a 15-vector
+        # parameterizing a 5x5 PSD residual matrix.
+        self.residual_net = VectorNet(
+            params.which_case if params.which_case in ("MLP", "ICNN") else "MLP",
+            in_features=5,
+            hidden=params.hidden,
+            out_features=15,
+            key=params.key,
+            positive_output=False,
+            activation=params.activation,
+        )
+
+    def get_K0(self) -> jax.Array:
+        return jax.nn.softplus(self.K0_raw)
+
+    def get_brazier_params(self):
+        rho_min = jax.nn.softplus(self.rho_min_raw)
+
+        # Clamp to avoid rho_min > 1.
+        rho_min = jnp.minimum(rho_min, 0.999)
+
+        if self.mode == "anisotropic":
+            kappa_c_pos = jax.nn.softplus(self.kappa_c_raw[0])
+            kappa_c_neg = jax.nn.softplus(self.kappa_c_raw[1])
+            alpha_pos = jax.nn.softplus(self.alpha_raw[0])
+            alpha_neg = jax.nn.softplus(self.alpha_raw[1])
+        else:
+            kappa_c = jax.nn.softplus(self.kappa_c_raw[0])
+            alpha = jax.nn.softplus(self.alpha_raw[0])
+
+            kappa_c_pos = kappa_c
+            kappa_c_neg = kappa_c
+            alpha_pos = alpha
+            alpha_neg = alpha
+
+        return rho_min, kappa_c_pos, kappa_c_neg, alpha_pos, alpha_neg
+
+    def brazier_softening_factor(self, kappa1: jax.Array) -> jax.Array:
+        """
+        Returns s(kappa1) in [rho_min, 1].
+
+        For anisotropic mode:
+            positive and negative bending directions can soften at different
+            critical curvatures.
+
+        For isotropic mode:
+            kappa_c_pos == kappa_c_neg and alpha_pos == alpha_neg.
+        """
+        rho_min, kappa_c_pos, kappa_c_neg, alpha_pos, alpha_neg = (
+            self.get_brazier_params()
+        )
+
+        soft_pos = jax.nn.softplus(kappa1 - kappa_c_pos)
+        soft_neg = jax.nn.softplus(-kappa1 - kappa_c_neg)
+
+        decay = jnp.exp(
+            -alpha_pos * soft_pos**2
+            -alpha_neg * soft_neg**2
+        )
+
+        return rho_min + (1.0 - rho_min) * decay
+
+    def get_structured_K(self, del_strain: jax.Array) -> jax.Array:
+        """
+        Structured PSD stiffness matrix.
+
+        Only the kappa1 stiffness is softened explicitly.
+        """
+        del_strain = jnp.ravel(del_strain)
+        if del_strain.shape != (5,):
+            raise ValueError(
+                f"Expected del_strain shape (5,), got {del_strain.shape}."
+            )
+
+        K0 = self.get_K0()
+        kappa1 = del_strain[3]
+
+        s = self.brazier_softening_factor(kappa1)
+
+        K_diag = K0.at[3].set(K0[3] * s)
+
+        return jnp.diag(K_diag)
+
+    def get_residual_K(self, del_strain: jax.Array) -> jax.Array:
+        """
+        Small PSD residual correction.
+
+        This lets the NN learn coupling terms and mild corrections while the
+        dominant Brazier softening is imposed explicitly.
+        """
+        if self.which_case == "no_residual":
+            return jnp.zeros((5, 5))
+
+        x = jnp.ravel(del_strain)
+        p = self.residual_net(x)
+
+        L = _vec_to_lower_triangular_5(self.corr_factor * p)
+        return L @ L.T
+
+    def get_K_matrix(self, del_strain: jax.Array) -> jax.Array:
+        return self.get_structured_K(del_strain) + self.get_residual_K(del_strain)
+
+    def __call__(self, del_strain: jax.Array) -> jax.Array:
+        del_strain = jnp.ravel(del_strain)
+        K = self.get_K_matrix(del_strain)
+        return 0.5 * del_strain @ K @ del_strain
