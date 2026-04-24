@@ -1,5 +1,6 @@
 import json
 import re
+import warnings
 import numpy as np
 from datetime import datetime
 import matplotlib.pyplot as plt
@@ -368,6 +369,90 @@ def append_right_ghost_clamp(
     return qs_new, xb_new, idx_b_new, lambdas_new, valid_new
 
 
+def prescribe_last_node_positions_from_qs(
+    qs,
+    xb,
+    idx_b,
+    n_last_nodes=2,
+    check_consistency=True,
+):
+    """
+    Add direct BCs for the translational DOFs of the last `n_last_nodes` nodes.
+
+    Values are copied from the corresponding qs columns. Existing idx_b entries
+    are left in place, with their xb columns replaced by qs values.
+    """
+    qs = np.asarray(qs)
+    xb = np.asarray(xb)
+    idx_b = np.asarray(idx_b, dtype=int)
+
+    if qs.ndim != 3:
+        raise ValueError(f"qs must have shape (n_traj, T, dof), got {qs.shape}")
+    if xb.ndim != 3:
+        raise ValueError(f"xb must have shape (n_traj, T, n_b), got {xb.shape}")
+    if idx_b.ndim != 1:
+        raise ValueError(f"idx_b must have shape (n_b,), got {idx_b.shape}")
+    if xb.shape[:2] != qs.shape[:2]:
+        raise ValueError(f"xb shape {xb.shape} incompatible with qs shape {qs.shape}")
+    if xb.shape[2] != len(idx_b):
+        raise ValueError(
+            f"xb.shape[2]={xb.shape[2]} must match len(idx_b)={len(idx_b)}"
+        )
+    if (qs.shape[2] + 1) % 4 != 0:
+        raise ValueError(
+            f"dof={qs.shape[2]} is not compatible with dof = 4*n_nodes - 1"
+        )
+
+    n_nodes = (qs.shape[2] + 1) // 4
+    if n_last_nodes < 1:
+        raise ValueError(f"n_last_nodes must be >= 1, got {n_last_nodes}")
+    if n_last_nodes > n_nodes:
+        raise ValueError(
+            f"n_last_nodes={n_last_nodes} cannot exceed n_nodes={n_nodes}"
+        )
+
+    idx_b_new_list = list(idx_b.tolist())
+    xb_new_cols = [xb[:, :, j].copy() for j in range(xb.shape[2])]
+    added_idx = []
+    replaced_idx = []
+
+    for node_id in range(n_nodes - n_last_nodes, n_nodes):
+        for component in range(3):
+            idx = 4 * node_id + component
+            values = qs[:, :, idx].copy()
+            if idx in idx_b_new_list:
+                j = idx_b_new_list.index(idx)
+                xb_new_cols[j] = values
+                replaced_idx.append(int(idx))
+            else:
+                idx_b_new_list.append(int(idx))
+                xb_new_cols.append(values)
+                added_idx.append(int(idx))
+
+    idx_b_new = np.asarray(idx_b_new_list, dtype=int)
+    xb_new = np.stack(xb_new_cols, axis=2)
+
+    if not added_idx:
+        warnings.warn(
+            "prescribe_last_node_positions_from_qs did not add any new idx_b "
+            f"entries because the final {n_last_nodes} nodes' translational DOFs "
+            f"were already prescribed: {replaced_idx}. Existing xb columns were "
+            "refreshed from qs.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    if check_consistency:
+        if xb_new.shape[2] != len(idx_b_new):
+            raise RuntimeError(
+                f"xb_new.shape[2]={xb_new.shape[2]} != len(idx_b_new)={len(idx_b_new)}"
+            )
+        if not np.all(np.isfinite(xb_new)):
+            raise ValueError("xb_new contains NaN/Inf")
+
+    return xb_new, idx_b_new
+
+
 def extract_directbc_dataset(
     input_json_path,
     output_npz_path,
@@ -378,6 +463,7 @@ def extract_directbc_dataset(
     make_plots=False,
     prepend_clamped_node_flag=False,
     append_right_ghost_clamp_flag=False,
+    prescribe_last_two_nodes_flag=False,
     min_marker_presence_ratio=0.8,
 ):
     """
@@ -423,6 +509,10 @@ def extract_directbc_dataset(
             z_ghost = z_last
         with edge_len computed from the 0th frame as the norm of the
         distance between marker_0 and marker_1 in transformed x-z coordinates.
+
+    - prescribe_last_two_nodes_flag:
+        add x/y/z direct BCs for the final two nodes, with xb values copied
+        from the corresponding qs columns. Existing BC columns are reused.
     """
 
     # =========================================================
@@ -943,6 +1033,18 @@ def extract_directbc_dataset(
         target_n_nodes += 1
 
     # =========================================================
+    # Optional prescribed motion on the final two nodes
+    # =========================================================
+    if prescribe_last_two_nodes_flag:
+        xb, idx_b = prescribe_last_node_positions_from_qs(
+            qs=qs,
+            xb=xb,
+            idx_b=idx_b,
+            n_last_nodes=2,
+            check_consistency=True,
+        )
+
+    # =========================================================
     # Final checks
     # =========================================================
     def assert_no_nans(name, arr):
@@ -977,6 +1079,7 @@ def extract_directbc_dataset(
     print("use_ee_as_last_node:", use_ee_as_last_node)
     print("prepend_clamped_node_flag:", prepend_clamped_node_flag)
     print("append_right_ghost_clamp_flag:", append_right_ghost_clamp_flag)
+    print("prescribe_last_two_nodes_flag:", prescribe_last_two_nodes_flag)
     print("min_marker_presence_ratio:", min_marker_presence_ratio)
     print("qs shape:", qs.shape)
     print("xb shape:", xb.shape)
