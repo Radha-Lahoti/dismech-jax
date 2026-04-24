@@ -101,9 +101,10 @@ def solve_step(
     abs_tol: float = 1e-8,
     rel_tol: float = 1e-6,
     fail_on_nonconvergence: bool = False,
+    early_stop: bool = False,
 ) -> jax.Array:
     """
-    Fixed-length damped Newton solve for one continuation/load step.
+    Bounded damped Newton solve for one continuation/load step.
 
     Includes:
       - optional solver-local Hessian symmetrization via SYMMETRIZE_HESSIAN
@@ -111,6 +112,7 @@ def solve_step(
       - energy line search that never accepts a higher-energy step if Armijo fails
       - absolute residual tolerance
       - relative residual reduction tolerance
+      - optional early exit before the fixed iteration budget is exhausted
       - optional hard failure via eqx.error_if
     """
     alphas = 0.5 ** jnp.arange(ls_steps)
@@ -118,7 +120,12 @@ def solve_step(
     q_init = sys.get_q(_lambda, q0)
     aux_init = update_aux_state(aux, q_init, sys)
 
-    def newton_step(carry, _):
+    def has_converged(res: jax.Array) -> jax.Array:
+        res_norm = jnp.linalg.norm(res)
+        rel_res_norm = res_norm / jnp.maximum(init_res_norm, 1e-16)
+        return jnp.logical_or(res_norm < abs_tol, rel_res_norm < rel_tol)
+
+    def newton_update(carry):
         q, aux_cur, e_old, res = carry
 
         H = sys.get_H(_lambda, q, model, aux_cur)
@@ -148,15 +155,34 @@ def solve_step(
         next_aux = update_aux_state(aux_cur, next_q, sys)
         next_res = -sys.get_F(_lambda, next_q, model, next_aux)
 
-        return (next_q, next_aux, next_e, next_res), None
+        return next_q, next_aux, next_e, next_res
+
+    def newton_step(carry, _):
+        return newton_update(carry), None
+
+    def newton_while_step(carry):
+        i, q, aux_cur, e_old, res = carry
+        next_q, next_aux, next_e, next_res = newton_update((q, aux_cur, e_old, res))
+        return i + 1, next_q, next_aux, next_e, next_res
+
+    def newton_while_cond(carry):
+        i, _, _, _, res = carry
+        return jnp.logical_and(i < iters, ~has_converged(res))
 
     init_e = sys.get_E(_lambda, q_init, model, aux_init)
     init_res = -sys.get_F(_lambda, q_init, model, aux_init)
     init_res_norm = jnp.linalg.norm(init_res)
 
-    (final_q, _, _, final_res), _ = jax.lax.scan(
-        newton_step, (q_init, aux_init, init_e, init_res), None, iters
-    )
+    if early_stop:
+        _, final_q, _, _, final_res = jax.lax.while_loop(
+            newton_while_cond,
+            newton_while_step,
+            (jnp.array(0), q_init, aux_init, init_e, init_res),
+        )
+    else:
+        (final_q, _, _, final_res), _ = jax.lax.scan(
+            newton_step, (q_init, aux_init, init_e, init_res), None, iters
+        )
 
     final_res_norm = jnp.linalg.norm(final_res)
     rel_res_norm = final_res_norm / jnp.maximum(init_res_norm, 1e-16)
@@ -189,11 +215,12 @@ def solve_step_fwd(
     abs_tol: float = 1e-8,
     rel_tol: float = 1e-6,
     fail_on_nonconvergence: bool = False,
+    early_stop: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     final_q = solve_step(
         model, _lambda, q0, aux, sys,
         iters, ls_steps, c1,
-        abs_tol, rel_tol, fail_on_nonconvergence
+        abs_tol, rel_tol, fail_on_nonconvergence, early_stop
     )
     return final_q, final_q
 
@@ -214,6 +241,7 @@ def solve_step_bwd(
     abs_tol: float = 1e-8,
     rel_tol: float = 1e-6,
     fail_on_nonconvergence: bool = False,
+    early_stop: bool = False,
 ) -> eqx.Module:
     return compute_ift_gradient(_lambda, res, grad_obj, model, aux, sys)
 
@@ -233,6 +261,7 @@ def solve(
     abs_tol: float = 1e-8,
     rel_tol: float = 1e-6,
     fail_on_nonconvergence: bool = False,
+    early_stop: bool = False,
 ) -> jax.Array:
     def scan_fn(res: tuple[jax.Array, State, jax.Array], target_lambda: jax.Array):
         _q, _aux, _current_lambda = res
@@ -247,7 +276,7 @@ def solve(
             new_q = solve_step(
                 model, next_L, q, aux, sys,
                 iters, ls_steps, c1,
-                abs_tol, rel_tol, fail_on_nonconvergence
+                abs_tol, rel_tol, fail_on_nonconvergence, early_stop
             )
             new_aux = update_aux_state(aux, new_q, sys)
             return new_q, new_aux, next_L
@@ -260,7 +289,7 @@ def solve(
     q_start = solve_step(
         model, lambdas[0], q0, aux, sys,
         iters, ls_steps, c1,
-        abs_tol, rel_tol, fail_on_nonconvergence
+        abs_tol, rel_tol, fail_on_nonconvergence, early_stop
     )
     aux_start = update_aux_state(aux, q_start, sys)
     _, qs = jax.lax.scan(scan_fn, (q_start, aux_start, lambdas[0]), lambdas)
@@ -282,6 +311,7 @@ def solve_fwd(
     abs_tol: float = 1e-8,
     rel_tol: float = 1e-6,
     fail_on_nonconvergence: bool = False,
+    early_stop: bool = False,
 ) -> tuple[jax.Array, tuple[jax.Array, State]]:
     def scan_fwd_fn(res: tuple[jax.Array, State, jax.Array], target_lambda: jax.Array):
         _q, _aux, _current_lambda = res
@@ -296,7 +326,7 @@ def solve_fwd(
             new_q = solve_step(
                 model, next_L, q, aux, sys,
                 iters, ls_steps, c1,
-                abs_tol, rel_tol, fail_on_nonconvergence
+                abs_tol, rel_tol, fail_on_nonconvergence, early_stop
             )
             new_aux = update_aux_state(aux, new_q, sys)
             return new_q, new_aux, next_L
@@ -309,7 +339,7 @@ def solve_fwd(
     q_start = solve_step(
         model, lambdas[0], q0, aux, sys,
         iters, ls_steps, c1,
-        abs_tol, rel_tol, fail_on_nonconvergence
+        abs_tol, rel_tol, fail_on_nonconvergence, early_stop
     )
     aux_start = update_aux_state(aux, q_start, sys)
 
@@ -336,6 +366,7 @@ def solve_bwd(
     abs_tol: float = 1e-8,
     rel_tol: float = 1e-6,
     fail_on_nonconvergence: bool = False,
+    early_stop: bool = False,
 ) -> eqx.Module:
     qs, auxs = res
     batched_ift_fn = jax.vmap(compute_ift_gradient, in_axes=(0, 0, 0, None, 0, None))
@@ -359,6 +390,7 @@ def solve_with_aux(
     abs_tol: float = 1e-8,
     rel_tol: float = 1e-6,
     fail_on_nonconvergence: bool = False,
+    early_stop: bool = False,
 ):
     def scan_fn(res, target_lambda):
         _q, _aux, _current_lambda = res
@@ -373,7 +405,7 @@ def solve_with_aux(
             new_q = solve_step(
                 model, next_L, q, aux, sys,
                 iters, ls_steps, c1,
-                abs_tol, rel_tol, fail_on_nonconvergence
+                abs_tol, rel_tol, fail_on_nonconvergence, early_stop
             )
             new_aux = update_aux_state(aux, new_q, sys)
             return new_q, new_aux, next_L
@@ -386,7 +418,7 @@ def solve_with_aux(
     q_start = solve_step(
         model, lambdas[0], q0, aux, sys,
         iters, ls_steps, c1,
-        abs_tol, rel_tol, fail_on_nonconvergence
+        abs_tol, rel_tol, fail_on_nonconvergence, early_stop
     )
     aux_start = update_aux_state(aux, q_start, sys)
 

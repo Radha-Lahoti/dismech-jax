@@ -343,11 +343,12 @@ class Rod(System[TripletState]):
         abs_tol: float = 1e-8,
         rel_tol: float = 1e-6,
         fail_on_nonconvergence: bool = False,
+        early_stop: bool = False,
     ) -> jax.Array:
         args = (
             model, lambdas, self.q0, aux, self,
             iters, ls_steps, c1, max_dlambda,
-            abs_tol, rel_tol, fail_on_nonconvergence
+            abs_tol, rel_tol, fail_on_nonconvergence, early_stop
         )
 
         if not self.is_batched(self.in_axes):
@@ -360,12 +361,12 @@ class Rod(System[TripletState]):
             solve,
             in_axes=(
                 None, None, 0, None, self.in_axes,
-                None, None, None, None, None, None, None
+                None, None, None, None, None, None, None, None
             ),
         )(
             model, lambdas, q0, aux, self,
             iters, ls_steps, c1, max_dlambda,
-            abs_tol, rel_tol, fail_on_nonconvergence
+            abs_tol, rel_tol, fail_on_nonconvergence, early_stop
         )
 
     @staticmethod
@@ -424,11 +425,12 @@ class Rod(System[TripletState]):
         abs_tol: float = 1e-8,
         rel_tol: float = 1e-6,
         fail_on_nonconvergence: bool = False,
+        early_stop: bool = False,
     ):
         args = (
             model, lambdas, self.q0, aux, self,
             iters, ls_steps, c1, max_dlambda,
-            abs_tol, rel_tol, fail_on_nonconvergence
+            abs_tol, rel_tol, fail_on_nonconvergence, early_stop
         )
 
         if not self.is_batched(self.in_axes):
@@ -441,12 +443,12 @@ class Rod(System[TripletState]):
             solve_with_aux,
             in_axes=(
                 None, None, 0, None, self.in_axes,
-                None, None, None, None, None, None, None
+                None, None, None, None, None, None, None, None
             ),
         )(
             model, lambdas, q0, aux, self,
             iters, ls_steps, c1, max_dlambda,
-            abs_tol, rel_tol, fail_on_nonconvergence
+            abs_tol, rel_tol, fail_on_nonconvergence, early_stop
         )
 
     def get_del_strain_history(

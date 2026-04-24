@@ -134,6 +134,7 @@ def predict(
     abs_tol=1e-8,
     rel_tol=1e-6,
     fail_on_nonconvergence=False,
+    early_stop=False,
 ):
     n_traj = xb.shape[0]
 
@@ -162,6 +163,7 @@ def predict(
             abs_tol=abs_tol,
             rel_tol=rel_tol,
             fail_on_nonconvergence=fail_on_nonconvergence,
+            early_stop=early_stop,
         )
 
     pred = jax.vmap(predict_one)(idx_all, xb, lam_all)
@@ -510,6 +512,7 @@ def traj_loss(
     abs_tol=1e-8,
     rel_tol=1e-6,
     fail_on_nonconvergence=False,
+    early_stop=False,
     hessian_reg_strength=0.0,
     hessian_reg_key=None,
     hessian_reg_probes=1,
@@ -541,6 +544,7 @@ def traj_loss(
         abs_tol=abs_tol,
         rel_tol=rel_tol,
         fail_on_nonconvergence=fail_on_nonconvergence,
+        early_stop=early_stop,
     )
     err = (qs_pred - qs_true) ** 2
     masked_err = jnp.where(valid[..., None], err, 0.0)
@@ -588,6 +592,7 @@ def dataset_loss(
     abs_tol=1e-8,
     rel_tol=1e-6,
     fail_on_nonconvergence=False,
+    early_stop=False,
     hessian_reg_strength=0.0,
     hessian_reg_key=None,
     hessian_reg_probes=1,
@@ -630,6 +635,7 @@ def dataset_loss(
                 abs_tol=abs_tol,
                 rel_tol=rel_tol,
                 fail_on_nonconvergence=fail_on_nonconvergence,
+                early_stop=early_stop,
                 hessian_reg_strength=hessian_reg_strength,
                 hessian_reg_key=reg_key,
                 hessian_reg_probes=hessian_reg_probes,
@@ -656,6 +662,7 @@ def dataset_loss(
                 abs_tol=abs_tol,
                 rel_tol=rel_tol,
                 fail_on_nonconvergence=fail_on_nonconvergence,
+                early_stop=early_stop,
                 hessian_reg_strength=hessian_reg_strength,
                 hessian_reg_key=reg_key,
                 hessian_reg_probes=hessian_reg_probes,
@@ -691,6 +698,7 @@ def train_model(
     abs_tol=1e-4,
     rel_tol=1e-4,
     fail_on_nonconvergence=False,
+    early_stop=False,
     hessian_reg_strength=0.0,
     hessian_reg_probes=1,
     hessian_reg_seed=0,
@@ -743,6 +751,7 @@ def train_model(
                 abs_tol=abs_tol,
                 rel_tol=rel_tol,
                 fail_on_nonconvergence=fail_on_nonconvergence,
+                early_stop=early_stop,
                 hessian_reg_strength=hessian_reg_strength,
                 hessian_reg_key=reg_key,
                 hessian_reg_probes=hessian_reg_probes,
@@ -804,6 +813,7 @@ def train_model(
                 abs_tol=abs_tol,
                 rel_tol=rel_tol,
                 fail_on_nonconvergence=False,
+                early_stop=early_stop,
                 force_loss_strength=force_loss_strength,
                 force_components=force_components,
                 force_sign=force_sign,
