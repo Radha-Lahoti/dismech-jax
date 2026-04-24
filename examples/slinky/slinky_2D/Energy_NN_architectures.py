@@ -23,23 +23,39 @@ def get_reduced_strain_features(
     return e0, e1, eb
 
 
-def get_nn_input(del_strain: jax.Array, input_mode: str) -> jax.Array:
+def get_nn_input(
+    del_strain: jax.Array,
+    input_mode: str,
+    only_stretching_NN: bool = False,
+) -> jax.Array:
     e0, e1, eb = get_reduced_strain_features(del_strain)
 
     if input_mode == "invariant":
+        if only_stretching_NN:
+            return jnp.array([e0**2 + e1**2])
         return jnp.array([e0**2 + e1**2, eb**2])
     if input_mode == "raw":
+        if only_stretching_NN:
+            return jnp.array([e0, e1])
         return jnp.array([e0, e1, eb])
 
     raise ValueError("input_mode must be 'invariant' or 'raw'")
 
 
-def _nn_in_features(input_mode: str) -> int:
+def _nn_in_features(input_mode: str, only_stretching_NN: bool = False) -> int:
     if input_mode == "invariant":
+        if only_stretching_NN:
+            return 1
         return 2
     if input_mode == "raw":
+        if only_stretching_NN:
+            return 2
         return 3
     raise ValueError("input_mode must be 'invariant' or 'raw'")
+
+
+def _stiffness_out_features(default_out_features: int, only_stretching_NN: bool) -> int:
+    return 1 if only_stretching_NN else default_out_features
 
 
 def _small_linear(in_features: int, out_features: int, key: jax.Array) -> eqx.nn.Linear:
@@ -112,6 +128,7 @@ class ModelParams(eqx.Module):
     which_case: str = eqx.field(static=True, default="MLP")
     corr_factor: float = eqx.field(static=True, default=1.0)
     input_mode: str = eqx.field(static=True, default="raw")
+    only_stretching_NN: bool = eqx.field(static=True, default=False)
     zero_reference: bool = eqx.field(static=True, default=True)
     activation: str = eqx.field(static=True, default="softplus")
 
@@ -385,9 +402,10 @@ class ScalarEnergyNN(eqx.Module):
     zero_reference: bool = eqx.field(static=True)
     corr_factor: float = eqx.field(static=True)
     input_mode: str = eqx.field(static=True)
+    only_stretching_NN: bool = eqx.field(static=True)
 
     def __init__(self, params: ModelParams):
-        in_features = _nn_in_features(params.input_mode)
+        in_features = _nn_in_features(params.input_mode, params.only_stretching_NN)
 
         self.mlp = ScalarNet(
             "MLP",
@@ -408,6 +426,7 @@ class ScalarEnergyNN(eqx.Module):
         self.zero_reference = params.zero_reference
         self.corr_factor = params.corr_factor
         self.input_mode = params.input_mode
+        self.only_stretching_NN = params.only_stretching_NN
 
     def _net_output(self, x: jax.Array) -> jax.Array:
         if self.which_case == "MLP":
@@ -417,7 +436,7 @@ class ScalarEnergyNN(eqx.Module):
         raise ValueError("which_case must be 'MLP' or 'ICNN'.")
 
     def __call__(self, del_strain: jax.Array) -> jax.Array:
-        x = get_nn_input(del_strain, self.input_mode)
+        x = get_nn_input(del_strain, self.input_mode, self.only_stretching_NN)
         y = self._net_output(x)
 
         if self.zero_reference:
@@ -516,10 +535,11 @@ class DiagonalPlusEnergyNN(eqx.Module, _DiagonalBase):
     zero_reference: bool = eqx.field(static=True)
     corr_factor: float = eqx.field(static=True)
     input_mode: str = eqx.field(static=True)
+    only_stretching_NN: bool = eqx.field(static=True)
 
     def __init__(self, params: ModelParams):
         
-        in_features = _nn_in_features(params.input_mode)
+        in_features = _nn_in_features(params.input_mode, params.only_stretching_NN)
 
         self.K0_raw = self._init_diag(params.der_K)
         self.mlp = ScalarMLP(in_features, params.hidden, params.key, positive_output=True, activation=params.activation)
@@ -528,13 +548,14 @@ class DiagonalPlusEnergyNN(eqx.Module, _DiagonalBase):
         self.zero_reference = params.zero_reference
         self.corr_factor = params.corr_factor
         self.input_mode = params.input_mode
+        self.only_stretching_NN = params.only_stretching_NN
 
     def baseline_energy(self, del_strain: jax.Array) -> jax.Array:
         k_s, k_b = self.get_K0()
         return self._diag_energy_from_entries(k_s, k_b, del_strain)
 
     def correction_energy(self, del_strain: jax.Array) -> jax.Array:
-        x = get_nn_input(del_strain, self.input_mode)
+        x = get_nn_input(del_strain, self.input_mode, self.only_stretching_NN)
         net = self.mlp if self.which_case == "MLP" else self.icnn
         out = net(x)
         if self.zero_reference:
@@ -560,10 +581,11 @@ class CholeskyPlusEnergyNN(eqx.Module, _CholeskyBase):
     zero_reference: bool = eqx.field(static=True)
     corr_factor: float = eqx.field(static=True)
     input_mode: str = eqx.field(static=True)
+    only_stretching_NN: bool = eqx.field(static=True)
 
     def __init__(self, params: ModelParams):
         
-        in_features = _nn_in_features(params.input_mode)
+        in_features = _nn_in_features(params.input_mode, params.only_stretching_NN)
 
         self.K0_raw = self._init_cholesky(params.der_K)
         self.mlp = ScalarMLP(in_features, params.hidden, params.key, positive_output=True, activation=params.activation)
@@ -572,6 +594,7 @@ class CholeskyPlusEnergyNN(eqx.Module, _CholeskyBase):
         self.zero_reference = params.zero_reference
         self.corr_factor = params.corr_factor
         self.input_mode = params.input_mode
+        self.only_stretching_NN = params.only_stretching_NN
 
     def get_K_entries(self) -> jax.Array:
         return self._B_to_entries(self.get_B0())
@@ -585,7 +608,7 @@ class CholeskyPlusEnergyNN(eqx.Module, _CholeskyBase):
         return self._chol_energy_from_entries(k_ss, k_sb, k_bb, del_strain)
 
     def correction_energy(self, del_strain: jax.Array) -> jax.Array:
-        x = get_nn_input(del_strain, self.input_mode)
+        x = get_nn_input(del_strain, self.input_mode, self.only_stretching_NN)
         net = self.mlp if self.which_case == "MLP" else self.icnn
         out = net(x)
         if self.zero_reference:
@@ -610,26 +633,32 @@ class DiagonalPlusStiffnessNN(eqx.Module, _DiagonalBase):
     which_case: str = eqx.field(static=True)
     corr_factor: float = eqx.field(static=True)
     input_mode: str = eqx.field(static=True)
+    only_stretching_NN: bool = eqx.field(static=True)
 
     def __init__(self, params: ModelParams):
         
-        in_features = _nn_in_features(params.input_mode)
+        in_features = _nn_in_features(params.input_mode, params.only_stretching_NN)
+        out_features = _stiffness_out_features(2, params.only_stretching_NN)
 
         self.K0_raw = self._init_diag(params.der_K)
         self.mlp = VectorNet(
-            "MLP", in_features, params.hidden, 2, params.key, positive_output=False, activation=params.activation
+            "MLP", in_features, params.hidden, out_features, params.key, positive_output=False, activation=params.activation
         )
         self.icnn = VectorNet(
-            "ICNN", in_features, params.hidden, 2, jax.random.fold_in(params.key, 1), positive_output=False
+            "ICNN", in_features, params.hidden, out_features, jax.random.fold_in(params.key, 1), positive_output=False
         )
         self.which_case = params.which_case
         self.corr_factor = params.corr_factor
         self.input_mode = params.input_mode
+        self.only_stretching_NN = params.only_stretching_NN
 
     def get_K_correction(self, del_strain: jax.Array) -> jax.Array:
-        x = get_nn_input(del_strain, self.input_mode)
+        x = get_nn_input(del_strain, self.input_mode, self.only_stretching_NN)
         raw = self.mlp(x) if self.which_case == "MLP" else self.icnn(x)
-        return jax.nn.softplus(self.corr_factor * raw)
+        corr = jax.nn.softplus(self.corr_factor * raw)
+        if self.only_stretching_NN:
+            return jnp.array([corr[0], 0.0])
+        return corr
 
     def get_K_total(self, del_strain: jax.Array) -> jax.Array:
         return self.get_K0() + self.get_K_correction(del_strain)
@@ -653,25 +682,35 @@ class CholeskyPlusStiffnessNN(eqx.Module, _CholeskyBase):
     which_case: str = eqx.field(static=True)
     corr_factor: float = eqx.field(static=True)
     input_mode: str = eqx.field(static=True)
+    only_stretching_NN: bool = eqx.field(static=True)
 
     def __init__(self, params: ModelParams):
         
-        in_features = _nn_in_features(params.input_mode)
+        in_features = _nn_in_features(params.input_mode, params.only_stretching_NN)
+        out_features = _stiffness_out_features(3, params.only_stretching_NN)
 
         self.K0_raw = self._init_cholesky(params.der_K)
         self.mlp = VectorNet(
-            "MLP", in_features, params.hidden, 3, params.key, positive_output=False, activation=params.activation
+            "MLP", in_features, params.hidden, out_features, params.key, positive_output=False, activation=params.activation
         )
         self.icnn = VectorNet(
-            "ICNN", in_features, params.hidden, 3, jax.random.fold_in(params.key, 1), positive_output=False
+            "ICNN", in_features, params.hidden, out_features, jax.random.fold_in(params.key, 1), positive_output=False
         )
         self.which_case = params.which_case
         self.corr_factor = params.corr_factor
         self.input_mode = params.input_mode
+        self.only_stretching_NN = params.only_stretching_NN
 
     def get_Bnn(self, del_strain: jax.Array) -> jax.Array:
-        x = get_nn_input(del_strain, self.input_mode)
+        x = get_nn_input(del_strain, self.input_mode, self.only_stretching_NN)
         p = self.mlp(x) if self.which_case == "MLP" else self.icnn(x)
+        if self.only_stretching_NN:
+            return jnp.array(
+                [
+                    [jax.nn.softplus(self.corr_factor * p[0]), 0.0],
+                    [0.0, 0.0],
+                ]
+            )
         L = _vec_to_L(self.corr_factor * p)
         return L @ L.T
 
@@ -700,25 +739,35 @@ class CholeskyPlusStiffnessSignedNN(eqx.Module, _CholeskyBase):
     which_case: str = eqx.field(static=True)
     corr_factor: float = eqx.field(static=True)
     input_mode: str = eqx.field(static=True)
+    only_stretching_NN: bool = eqx.field(static=True)
 
     def __init__(self, params: ModelParams):
         
-        in_features = _nn_in_features(params.input_mode)
+        in_features = _nn_in_features(params.input_mode, params.only_stretching_NN)
+        out_features = _stiffness_out_features(3, params.only_stretching_NN)
 
         self.K0_raw = self._init_cholesky(params.der_K)
         self.mlp = VectorNet(
-            "MLP", in_features, params.hidden, 3, params.key, positive_output=False, activation=params.activation
+            "MLP", in_features, params.hidden, out_features, params.key, positive_output=False, activation=params.activation
         )
         self.icnn = VectorNet(
-            "ICNN", in_features, params.hidden, 3, jax.random.fold_in(params.key, 1), positive_output=False
+            "ICNN", in_features, params.hidden, out_features, jax.random.fold_in(params.key, 1), positive_output=False
         )
         self.which_case = params.which_case
         self.corr_factor = params.corr_factor
         self.input_mode = params.input_mode
+        self.only_stretching_NN = params.only_stretching_NN
 
     def get_B_total(self, del_strain: jax.Array) -> jax.Array:
-        x = get_nn_input(del_strain, self.input_mode)
+        x = get_nn_input(del_strain, self.input_mode, self.only_stretching_NN)
         dp = self.mlp(x) if self.which_case == "MLP" else self.icnn(x)
+        if self.only_stretching_NN:
+            return self.get_B0() + jnp.array(
+                [
+                    [jax.nn.softplus(self.corr_factor * dp[0]), 0.0],
+                    [0.0, 0.0],
+                ]
+            )
         L = _vec_to_L(self.K0_raw + self.corr_factor * dp)
         return L @ L.T
 
@@ -760,6 +809,26 @@ def _vec_to_lower_triangular_5(p: jax.Array) -> jax.Array:
     return L
 
 
+def _full_strain_nn_input(
+    del_strain: jax.Array,
+    input_mode: str,
+    only_stretching_NN: bool,
+) -> jax.Array:
+    if only_stretching_NN:
+        return get_nn_input(del_strain, input_mode, only_stretching_NN=True)
+
+    del_strain = jnp.ravel(del_strain)
+    if del_strain.shape != (5,):
+        raise ValueError(f"Expected del_strain shape (5,), got {del_strain.shape}.")
+    return del_strain
+
+
+def _full_strain_nn_in_features(input_mode: str, only_stretching_NN: bool) -> int:
+    if only_stretching_NN:
+        return _nn_in_features(input_mode, only_stretching_NN=True)
+    return 5
+
+
 class StructuredBrazierCholeskyEnergyNN(eqx.Module):
     """
     Energy model for strain vector
@@ -796,6 +865,8 @@ class StructuredBrazierCholeskyEnergyNN(eqx.Module):
     which_case: str = eqx.field(static=True)    # "MLP", "ICNN", or "no_residual"
     corr_factor: float = eqx.field(static=True)
     activation: str = eqx.field(static=True)
+    input_mode: str = eqx.field(static=True)
+    only_stretching_NN: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -813,6 +884,8 @@ class StructuredBrazierCholeskyEnergyNN(eqx.Module):
         self.which_case = params.which_case
         self.corr_factor = params.corr_factor
         self.activation = params.activation
+        self.input_mode = params.input_mode
+        self.only_stretching_NN = params.only_stretching_NN
 
         der_K = jnp.ravel(params.der_K)
         if der_K.shape != (5,):
@@ -836,13 +909,16 @@ class StructuredBrazierCholeskyEnergyNN(eqx.Module):
             self.kappa_c_raw = inv_softplus(jnp.array([kappa_c_init]))
             self.alpha_raw = inv_softplus(jnp.array([alpha_init]))
 
-        # NN sees the full 5D strain vector and outputs a 15-vector
-        # parameterizing a 5x5 PSD residual matrix.
+        # By default the NN sees the full 5D strain vector and outputs a 15-vector
+        # parameterizing a 5x5 PSD residual matrix. In stretching-only mode, it
+        # sees only stretching features and contributes only to K[0, 0].
         self.residual_net = VectorNet(
             params.which_case if params.which_case in ("MLP", "ICNN") else "MLP",
-            in_features=5,
+            in_features=_full_strain_nn_in_features(
+                params.input_mode, params.only_stretching_NN
+            ),
             hidden=params.hidden,
-            out_features=15,
+            out_features=_stiffness_out_features(15, params.only_stretching_NN),
             key=params.key,
             positive_output=False,
             activation=params.activation,
@@ -929,8 +1005,14 @@ class StructuredBrazierCholeskyEnergyNN(eqx.Module):
         if self.which_case == "no_residual":
             return jnp.zeros((5, 5))
 
-        x = jnp.ravel(del_strain)
+        x = _full_strain_nn_input(
+            del_strain, self.input_mode, self.only_stretching_NN
+        )
         p = self.residual_net(x)
+
+        if self.only_stretching_NN:
+            K = jnp.zeros((5, 5))
+            return K.at[0, 0].set(jax.nn.softplus(self.corr_factor * p[0]))
 
         L = _vec_to_lower_triangular_5(self.corr_factor * p)
         return L @ L.T

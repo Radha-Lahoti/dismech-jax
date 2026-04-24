@@ -313,165 +313,6 @@ def reaction_force_loss(
         masked_err = jnp.where(valid[..., None], err, 0.0)
     return jnp.sum(masked_err) / jnp.maximum(jnp.sum(valid), 1.0)
 
-
-def force_match_diagnostics(
-    model,
-    base,
-    aux,
-    data: Dataset,
-    traj_idx=0,
-    force_components=(0, 1, 2),
-    force_sign=1.0,
-):
-    """
-    Compare learned reaction forces against measured forces for one trajectory.
-
-    The returned MSE values compare both sign conventions:
-      mse_same_sign:     pred_force vs force_true
-      mse_opposite_sign: -pred_force vs force_true
-    If mse_opposite_sign is smaller, train/evaluate with force_sign=-force_sign.
-    """
-    if data.forces is None:
-        raise ValueError("Dataset has no force data. Load with force_key='F' or include an F/force array.")
-
-    if data.idx_b.ndim == 1:
-        idx_b = data.idx_b
-    else:
-        idx_b = data.idx_b[traj_idx]
-
-    if data.lambdas.ndim == 1:
-        lambdas = data.lambdas
-    else:
-        lambdas = data.lambdas[traj_idx]
-
-    qs_true = data.qs[traj_idx]
-    force_true = data.forces[traj_idx]
-    valid = data.valid[traj_idx]
-
-    pred_force = predict_reaction_force(
-        model,
-        base,
-        aux,
-        lambdas,
-        qs_true,
-        idx_b,
-        valid,
-        force_components=force_components,
-        force_sign=force_sign,
-    )
-
-    if force_true.ndim == 1:
-        pred_cmp = pred_force[:, 0]
-    else:
-        n_force = min(force_true.shape[-1], pred_force.shape[-1])
-        force_true = force_true[:, :n_force]
-        pred_cmp = pred_force[:, :n_force]
-
-    mask = valid.astype(pred_cmp.dtype)
-    if force_true.ndim > 1:
-        mask = mask[..., None]
-
-    same_err = (pred_cmp - force_true) ** 2
-    opposite_err = (-pred_cmp - force_true) ** 2
-    denom = jnp.maximum(jnp.sum(mask), 1.0)
-    mse_same = jnp.sum(jnp.where(mask.astype(bool), same_err, 0.0)) / denom
-    mse_opposite = jnp.sum(jnp.where(mask.astype(bool), opposite_err, 0.0)) / denom
-    best_sign = jnp.where(mse_same <= mse_opposite, force_sign, -force_sign)
-
-    return {
-        "lambdas": lambdas,
-        "valid": valid,
-        "force_true": force_true,
-        "force_pred": pred_cmp,
-        "mse_same_sign": mse_same,
-        "mse_opposite_sign": mse_opposite,
-        "rmse_same_sign": jnp.sqrt(mse_same),
-        "rmse_opposite_sign": jnp.sqrt(mse_opposite),
-        "best_force_sign": best_sign,
-    }
-
-
-def print_force_match_diagnostics(
-    model,
-    base,
-    aux,
-    data: Dataset,
-    traj_idx=0,
-    force_components=(0, 1, 2),
-    force_sign=1.0,
-):
-    diag = force_match_diagnostics(
-        model,
-        base,
-        aux,
-        data,
-        traj_idx=traj_idx,
-        force_components=force_components,
-        force_sign=force_sign,
-    )
-    mse_same = float(diag["mse_same_sign"])
-    mse_opp = float(diag["mse_opposite_sign"])
-    best = float(diag["best_force_sign"])
-    print(f"Force MSE, same sign:     {mse_same:.6e}")
-    print(f"Force MSE, opposite sign: {mse_opp:.6e}")
-    print(f"Suggested force_sign:     {best:+.0f}")
-    return diag
-
-
-def plot_force_match(
-    model,
-    base,
-    aux,
-    data: Dataset,
-    traj_idx=0,
-    force_components=(0, 1, 2),
-    force_sign=1.0,
-    use_best_sign=True,
-    component_labels=("Fx", "Fy", "Fz"),
-    ax=None,
-):
-    """
-    Plot predicted and ground-truth reaction-force components after training.
-    """
-    import matplotlib.pyplot as plt
-
-    diag = force_match_diagnostics(
-        model,
-        base,
-        aux,
-        data,
-        traj_idx=traj_idx,
-        force_components=force_components,
-        force_sign=force_sign,
-    )
-
-    lambdas = np.asarray(diag["lambdas"])
-    valid = np.asarray(diag["valid"], dtype=bool)
-    force_true = np.asarray(diag["force_true"])
-    force_pred = np.asarray(diag["force_pred"])
-
-    if use_best_sign and float(diag["best_force_sign"]) != float(force_sign):
-        force_pred = -force_pred
-
-    if ax is None:
-        _, ax = plt.subplots(figsize=(8, 4))
-
-    if force_true.ndim == 1:
-        ax.plot(lambdas[valid], force_true[valid], "k-", label="true")
-        ax.plot(lambdas[valid], force_pred[valid], "--", label="pred")
-    else:
-        labels = component_labels[: force_true.shape[-1]]
-        for i, label in enumerate(labels):
-            ax.plot(lambdas[valid], force_true[valid, i], "-", label=f"{label} true")
-            ax.plot(lambdas[valid], force_pred[valid, i], "--", label=f"{label} pred")
-
-    ax.set_xlabel("lambda")
-    ax.set_ylabel("reaction force")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    return diag, ax
-
-
 # =========================================================
 # Loss (MSE over trajectories)
 # =========================================================
@@ -698,7 +539,7 @@ def train_model(
     abs_tol=1e-4,
     rel_tol=1e-4,
     fail_on_nonconvergence=False,
-    early_stop=False,
+    early_stop=True,
     hessian_reg_strength=0.0,
     hessian_reg_probes=1,
     hessian_reg_seed=0,
@@ -856,3 +697,164 @@ def train_model(
             )
 
     return model, train_hist, valid_hist
+
+
+##========================================================##
+# Diagnostics for reaction-force matching
+##========================================================##
+def force_match_diagnostics(
+    model,
+    base,
+    aux,
+    data: Dataset,
+    traj_idx=0,
+    force_components=(0, 1, 2),
+    force_sign=1.0,
+):
+    """
+    Compare learned reaction forces against measured forces for one trajectory.
+
+    The returned MSE values compare both sign conventions:
+      mse_same_sign:     pred_force vs force_true
+      mse_opposite_sign: -pred_force vs force_true
+    If mse_opposite_sign is smaller, train/evaluate with force_sign=-force_sign.
+    """
+    if data.forces is None:
+        raise ValueError("Dataset has no force data. Load with force_key='F' or include an F/force array.")
+
+    if data.idx_b.ndim == 1:
+        idx_b = data.idx_b
+    else:
+        idx_b = data.idx_b[traj_idx]
+
+    if data.lambdas.ndim == 1:
+        lambdas = data.lambdas
+    else:
+        lambdas = data.lambdas[traj_idx]
+
+    qs_true = data.qs[traj_idx]
+    force_true = data.forces[traj_idx]
+    valid = data.valid[traj_idx]
+
+    pred_force = predict_reaction_force(
+        model,
+        base,
+        aux,
+        lambdas,
+        qs_true,
+        idx_b,
+        valid,
+        force_components=force_components,
+        force_sign=force_sign,
+    )
+
+    if force_true.ndim == 1:
+        pred_cmp = pred_force[:, 0]
+    else:
+        n_force = min(force_true.shape[-1], pred_force.shape[-1])
+        force_true = force_true[:, :n_force]
+        pred_cmp = pred_force[:, :n_force]
+
+    mask = valid.astype(pred_cmp.dtype)
+    if force_true.ndim > 1:
+        mask = mask[..., None]
+
+    same_err = (pred_cmp - force_true) ** 2
+    opposite_err = (-pred_cmp - force_true) ** 2
+    denom = jnp.maximum(jnp.sum(mask), 1.0)
+    mse_same = jnp.sum(jnp.where(mask.astype(bool), same_err, 0.0)) / denom
+    mse_opposite = jnp.sum(jnp.where(mask.astype(bool), opposite_err, 0.0)) / denom
+    best_sign = jnp.where(mse_same <= mse_opposite, force_sign, -force_sign)
+
+    return {
+        "lambdas": lambdas,
+        "valid": valid,
+        "force_true": force_true,
+        "force_pred": pred_cmp,
+        "mse_same_sign": mse_same,
+        "mse_opposite_sign": mse_opposite,
+        "rmse_same_sign": jnp.sqrt(mse_same),
+        "rmse_opposite_sign": jnp.sqrt(mse_opposite),
+        "best_force_sign": best_sign,
+    }
+
+
+def print_force_match_diagnostics(
+    model,
+    base,
+    aux,
+    data: Dataset,
+    traj_idx=0,
+    force_components=(0, 1, 2),
+    force_sign=1.0,
+):
+    diag = force_match_diagnostics(
+        model,
+        base,
+        aux,
+        data,
+        traj_idx=traj_idx,
+        force_components=force_components,
+        force_sign=force_sign,
+    )
+    mse_same = float(diag["mse_same_sign"])
+    mse_opp = float(diag["mse_opposite_sign"])
+    best = float(diag["best_force_sign"])
+    print(f"Force MSE, same sign:     {mse_same:.6e}")
+    print(f"Force MSE, opposite sign: {mse_opp:.6e}")
+    print(f"Suggested force_sign:     {best:+.0f}")
+    return diag
+
+
+def plot_force_match(
+    model,
+    base,
+    aux,
+    data: Dataset,
+    traj_idx=0,
+    force_components=(0, 1, 2),
+    force_sign=1.0,
+    use_best_sign=True,
+    component_labels=("Fx", "Fy", "Fz"),
+    ax=None,
+):
+    """
+    Plot predicted and ground-truth reaction-force components after training.
+    """
+    import matplotlib.pyplot as plt
+
+    diag = force_match_diagnostics(
+        model,
+        base,
+        aux,
+        data,
+        traj_idx=traj_idx,
+        force_components=force_components,
+        force_sign=force_sign,
+    )
+
+    lambdas = np.asarray(diag["lambdas"])
+    valid = np.asarray(diag["valid"], dtype=bool)
+    force_true = np.asarray(diag["force_true"])
+    force_pred = np.asarray(diag["force_pred"])
+
+    if use_best_sign and float(diag["best_force_sign"]) != float(force_sign):
+        force_pred = -force_pred
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(8, 4))
+
+    if force_true.ndim == 1:
+        ax.plot(lambdas[valid], force_true[valid], "k-", label="true")
+        ax.plot(lambdas[valid], force_pred[valid], "--", label="pred")
+    else:
+        labels = component_labels[: force_true.shape[-1]]
+        for i, label in enumerate(labels):
+            ax.plot(lambdas[valid], force_true[valid, i], "-", label=f"{label} true")
+            ax.plot(lambdas[valid], force_pred[valid, i], "--", label=f"{label} pred")
+
+    ax.set_xlabel("lambda")
+    ax.set_ylabel("reaction force")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    return diag, ax

@@ -133,6 +133,7 @@ class SweepConfig:
     hidden: tuple[int, ...] = (10,)
     corr_factor: float = 1.0
     input_mode: str = "raw"          # "raw" or "invariant"
+    only_stretching_NN: bool = False
     zero_reference: bool = True      # relevant for energy-correction families
     activation: str = "softplus"     # relevant for MLP nets
     n_epochs: int = 100
@@ -227,6 +228,7 @@ def make_model_params(cfg: SweepConfig, spec: ArchSpec) -> ModelParams:
         which_case=spec.which_case,
         corr_factor=cfg.corr_factor,
         input_mode=cfg.input_mode,
+        only_stretching_NN=cfg.only_stretching_NN,
         zero_reference=cfg.zero_reference,
         activation=cfg.activation,
     )
@@ -239,6 +241,7 @@ def experiment_name(spec: ArchSpec, cfg: SweepConfig) -> str:
         f"{spec.name}"
         f"__hid_{hidden_str}"
         f"__inp_{cfg.input_mode}"
+        f"__stretchNN_{int(cfg.only_stretching_NN)}"
         f"__act_{cfg.activation}"
         f"__corr_{cfg.corr_factor:g}"
         f"__{zr}"
@@ -404,6 +407,7 @@ def save_results_npz(
         input_mode=cfg.input_mode,
         activation=cfg.activation,
         corr_factor=cfg.corr_factor,
+        only_stretching_NN=int(cfg.only_stretching_NN),
         zero_reference=int(cfg.zero_reference),
         seed=cfg.seed,
         der_K_diag=np.asarray(cfg.der_K_diag, dtype=float),
@@ -463,6 +467,7 @@ def run_one_architecture(
         print(f"  which_case              : {spec.which_case}")
         print(f"  hidden                  : {cfg.hidden}")
         print(f"  input_mode              : {cfg.input_mode}")
+        print(f"  only_stretching_NN      : {cfg.only_stretching_NN}")
         print(f"  activation              : {cfg.activation}")
         print(f"  corr_factor             : {cfg.corr_factor}")
         print(f"  zero_reference          : {cfg.zero_reference}")

@@ -241,7 +241,7 @@ def solve_step_bwd(
     abs_tol: float = 1e-8,
     rel_tol: float = 1e-6,
     fail_on_nonconvergence: bool = False,
-    early_stop: bool = False,
+    early_stop: bool = True,
 ) -> eqx.Module:
     return compute_ift_gradient(_lambda, res, grad_obj, model, aux, sys)
 
