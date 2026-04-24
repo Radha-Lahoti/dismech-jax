@@ -211,7 +211,19 @@ class Rod(System[TripletState]):
         self, _lambda: jax.Array, q: jax.Array, model: eqx.Module, aux: TripletState
     ) -> jax.Array:
         mask = self.bc.mask(q)
-        H = jax.hessian(self.get_E, 1)(_lambda, q, model, aux)
+        batch_qs = self._global_q_to_batch_q(q)
+        H_batched = jax.vmap(
+            lambda t, q_loc, _aux: jax.hessian(t.get_energy)(q_loc, model, _aux)
+        )(self.triplets, batch_qs, aux)
+
+        local_idx = jnp.arange(H_batched.shape[-1])
+        global_idx = jnp.arange(H_batched.shape[0])[:, None] * 4 + local_idx[None, :]
+        rows = global_idx[:, :, None]
+        cols = global_idx[:, None, :]
+
+        H = jnp.zeros((q.shape[0], q.shape[0]))
+        H = H.at[rows, cols].add(H_batched)
+        H = H + jax.hessian(self.E_ext, 0)(q, _lambda)
         H = H * mask[:, None] * mask[None, :]
         diag_idx = jnp.arange(H.shape[0])
         return H.at[diag_idx, diag_idx].add(1.0 - mask)
@@ -267,7 +279,7 @@ class Rod(System[TripletState]):
             q, v = y[:n_dofs], y[n_dofs:]
 
             q_fixed, v_fixed = jax.jvp(
-                lambda l: self.bc.apply(q, l), (_lambda,), (jnp.ones_like(_lambda),)
+                lambda _lam: self.bc.apply(q, _lam), (_lambda,), (jnp.ones_like(_lambda),)
             )
 
             v = v * self.bc.mask(q) + v_fixed * (1.0 - self.bc.mask(q))
