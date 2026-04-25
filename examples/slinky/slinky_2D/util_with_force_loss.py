@@ -546,6 +546,10 @@ def train_model(
     force_loss_strength=1.0,
     force_components=(0, 1, 2),
     force_sign=1.0,
+    weight_decay=0.0,
+    early_stopping_patience=None,
+    early_stopping_min_delta=0.0,
+    restore_best_model=True,
 ):
     # --- setup ---
     base, aux = get_slinky(properties)
@@ -562,11 +566,19 @@ def train_model(
         decay_steps=n_epochs + 1,
         alpha=0.1,
     )
-    # Optax: Adam
+    if early_stopping_patience is not None and valid_every is None:
+        raise ValueError("early_stopping_patience requires valid_every to be set.")
+
+    # Optax: Adam by default; AdamW when weight decay is requested.
+    optimizer = (
+        optax.adamw(learning_rate=schedule, weight_decay=weight_decay)
+        if weight_decay != 0.0
+        else optax.adam(learning_rate=schedule)
+    )
     opt = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adam(learning_rate=schedule),
-    ) 
+        optimizer,
+    )
 
     # # Optax: AdaBelief
     # opt = optax.chain(
@@ -611,6 +623,10 @@ def train_model(
     valid_hist = []
 
     last_val_loss = jnp.nan
+    best_model = model
+    best_val_loss = jnp.inf
+    best_epoch = -1
+    epochs_without_improvement = 0
     snapshot_epoch_set = None if snapshot_epochs is None else set(snapshot_epochs)
 
     if snapshot_fn is not None and snapshot_before_training:
@@ -660,6 +676,15 @@ def train_model(
                 force_sign=force_sign,
             )
 
+            improved = last_val_loss < (best_val_loss - early_stopping_min_delta)
+            if bool(improved):
+                best_model = model
+                best_val_loss = last_val_loss
+                best_epoch = i
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += valid_every
+
         valid_hist.append(last_val_loss)
 
         if i % 100 == 0:
@@ -695,6 +720,21 @@ def train_model(
                 train_loss=train_loss,
                 val_loss=last_val_loss,
             )
+
+        if (
+            early_stopping_patience is not None
+            and do_valid
+            and epochs_without_improvement >= early_stopping_patience
+        ):
+            print(
+                f"Early stopping at epoch {i:03d} | "
+                f"Best epoch: {best_epoch:03d} | "
+                f"Best valid: {float(best_val_loss):.3e}"
+            )
+            break
+
+    if restore_best_model and best_epoch >= 0:
+        model = best_model
 
     return model, train_hist, valid_hist
 

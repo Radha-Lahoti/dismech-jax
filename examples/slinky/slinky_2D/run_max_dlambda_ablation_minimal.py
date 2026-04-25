@@ -85,6 +85,7 @@ class MaxDlambdaAblationConfig:
     corr_factor: float = 1.0
     input_mode: str = "raw"
     only_stretching_NN: bool = False
+    only_bending_NN: bool = False
     zero_reference: bool = True
     activation: str = "softplus"
 
@@ -138,6 +139,7 @@ def _make_params(cfg: MaxDlambdaAblationConfig, spec: ArchSpec, seed: int) -> Mo
         corr_factor=cfg.corr_factor,
         input_mode=cfg.input_mode,
         only_stretching_NN=cfg.only_stretching_NN,
+        only_bending_NN=cfg.only_bending_NN,
         zero_reference=cfg.zero_reference,
         activation=cfg.activation,
     )
@@ -151,6 +153,7 @@ def _experiment_name(spec: ArchSpec, cfg: MaxDlambdaAblationConfig, seed: int, m
         f"__hid_{hidden}"
         f"__inp_{cfg.input_mode}"
         f"__stretchNN_{int(cfg.only_stretching_NN)}"
+        f"__bendNN_{int(cfg.only_bending_NN)}"
         f"__act_{cfg.activation}"
         f"__corr_{cfg.corr_factor:g}"
         f"__{zr}"

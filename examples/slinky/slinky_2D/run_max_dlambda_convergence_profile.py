@@ -30,6 +30,7 @@ class MaxDlambdaConvergenceProfileConfig:
     corr_factor: float = 1.0
     input_mode: str = "raw"
     only_stretching_NN: bool = False
+    only_bending_NN: bool = False
     zero_reference: bool = True
     activation: str = "softplus"
 
@@ -78,6 +79,7 @@ def _make_sweep_cfg(
         corr_factor=cfg.corr_factor,
         input_mode=cfg.input_mode,
         only_stretching_NN=cfg.only_stretching_NN,
+        only_bending_NN=cfg.only_bending_NN,
         zero_reference=cfg.zero_reference,
         activation=cfg.activation,
         n_epochs=cfg.n_epochs,
