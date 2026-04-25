@@ -17,7 +17,7 @@ from Energy_NN_architectures import (
     ModelParams,
     ScalarEnergyNN,
 )
-from util import Dataset, get_slinky, predict, train_model
+from util_with_force_loss import Dataset, get_slinky, predict, train_model
 
 
 @dataclass(frozen=True)
@@ -100,12 +100,24 @@ class MaxDlambdaAblationConfig:
     abs_tol: float = 1e-8
     rel_tol: float = 1e-6
 
-    # This is passed only into train_model(...). Inside util.py, validation loss
-    # is already computed with fail_on_nonconvergence=False.
+    # This is passed only into train_model(...). Validation loss is already
+    # computed with fail_on_nonconvergence=False.
     train_fail_on_nonconvergence: bool = True
 
     # This is passed only into final predict(...), after training completes.
     prediction_fail_on_nonconvergence: bool = False
+
+    # Optional Hessian spectral regularizer.
+    hessian_reg_strength: float = 0.0
+    hessian_reg_probes: int = 1
+    hessian_reg_seed: int = 0
+
+    # Optional reaction-force loss.
+    force_key: Optional[str] = None
+    force_loss_strength: float = 0.0
+    force_components: tuple[int, ...] = (0, 1, 2)
+    force_sign: float = 1.0
+    return_loss_components: bool = False
 
     output_dir: str = "max_dlambda_ablation_minimal_outputs"
     save_npz: bool = True
@@ -148,7 +160,7 @@ def _make_params(cfg: MaxDlambdaAblationConfig, spec: ArchSpec, seed: int) -> Mo
 def _experiment_name(spec: ArchSpec, cfg: MaxDlambdaAblationConfig, seed: int, max_dlambda: float) -> str:
     hidden = "x".join(str(h) for h in cfg.hidden)
     zr = "zr1" if cfg.zero_reference else "zr0"
-    return (
+    name = (
         f"{spec.name}"
         f"__hid_{hidden}"
         f"__inp_{cfg.input_mode}"
@@ -161,6 +173,20 @@ def _experiment_name(spec: ArchSpec, cfg: MaxDlambdaAblationConfig, seed: int, m
         f"__mdl_{max_dlambda:g}"
         f"__it_{cfg.iters}"
     )
+    if cfg.hessian_reg_strength != 0.0:
+        name += (
+            f"__hreg_{cfg.hessian_reg_strength:g}"
+            f"__hprobe_{cfg.hessian_reg_probes}"
+            f"__hseed_{cfg.hessian_reg_seed}"
+        )
+    if cfg.force_loss_strength != 0.0:
+        comps = "-".join(str(c) for c in cfg.force_components)
+        name += (
+            f"__floss_{cfg.force_loss_strength:g}"
+            f"__fcomp_{comps}"
+            f"__fsign_{cfg.force_sign:g}"
+        )
+    return name
 
 
 def _classify_exception(exc: Exception) -> str:
@@ -240,6 +266,13 @@ def _make_record(
         "train_fail_on_nonconvergence": bool(cfg.train_fail_on_nonconvergence),
         "validation_loss_fail_on_nonconvergence": False,
         "prediction_fail_on_nonconvergence": bool(cfg.prediction_fail_on_nonconvergence),
+        "hessian_reg_strength": float(cfg.hessian_reg_strength),
+        "hessian_reg_probes": int(cfg.hessian_reg_probes),
+        "hessian_reg_seed": int(cfg.hessian_reg_seed),
+        "force_key": cfg.force_key,
+        "force_loss_strength": float(cfg.force_loss_strength),
+        "force_components": [int(c) for c in cfg.force_components],
+        "force_sign": float(cfg.force_sign),
         "success": bool(success),
         "failure_reason": failure_reason,
         "train_hist_finite": train_finite,
@@ -279,9 +312,12 @@ def _save_npz(
     valid_pred,
     train_data: Dataset,
     valid_data: Dataset,
+    train_displacement_hist=None,
+    train_force_hist=None,
+    valid_displacement_hist=None,
+    valid_force_hist=None,
 ):
-    np.savez(
-        os.path.join(exp_dir, "results.npz"),
+    save_dict = dict(
         arch_name=spec.name,
         model_cls=spec.model_cls.__name__,
         which_case=spec.which_case,
@@ -290,6 +326,13 @@ def _save_npz(
         train_fail_on_nonconvergence=bool(cfg.train_fail_on_nonconvergence),
         validation_loss_fail_on_nonconvergence=False,
         prediction_fail_on_nonconvergence=bool(cfg.prediction_fail_on_nonconvergence),
+        hessian_reg_strength=float(cfg.hessian_reg_strength),
+        hessian_reg_probes=int(cfg.hessian_reg_probes),
+        hessian_reg_seed=int(cfg.hessian_reg_seed),
+        force_key="" if cfg.force_key is None else cfg.force_key,
+        force_loss_strength=float(cfg.force_loss_strength),
+        force_components=np.asarray(cfg.force_components, dtype=int),
+        force_sign=float(cfg.force_sign),
         train_hist=np.asarray(train_hist, dtype=float),
         valid_hist=np.asarray(valid_hist, dtype=float),
         train_pred=np.asarray(train_pred, dtype=float),
@@ -301,6 +344,16 @@ def _save_npz(
         train_valid_mask=np.asarray(train_data.valid, dtype=bool),
         valid_valid_mask=np.asarray(valid_data.valid, dtype=bool),
     )
+    if train_displacement_hist is not None:
+        save_dict["train_displacement_hist"] = np.asarray(train_displacement_hist, dtype=float)
+    if train_force_hist is not None:
+        save_dict["train_force_hist"] = np.asarray(train_force_hist, dtype=float)
+    if valid_displacement_hist is not None:
+        save_dict["valid_displacement_hist"] = np.asarray(valid_displacement_hist, dtype=float)
+    if valid_force_hist is not None:
+        save_dict["valid_force_hist"] = np.asarray(valid_force_hist, dtype=float)
+
+    np.savez(os.path.join(exp_dir, "results.npz"), **save_dict)
 
 
 def run_one_max_dlambda_case(
@@ -332,15 +385,23 @@ def run_one_max_dlambda_case(
         print(f"training fail_on_nonconvergence      : {cfg.train_fail_on_nonconvergence}")
         print("validation loss fail_on_nonconvergence: False")
         print(f"prediction fail_on_nonconvergence    : {cfg.prediction_fail_on_nonconvergence}")
+        print(f"hessian_reg_strength                 : {cfg.hessian_reg_strength:.3e}")
+        print(f"hessian_reg_probes                   : {cfg.hessian_reg_probes}")
+        print(f"hessian_reg_seed                     : {cfg.hessian_reg_seed}")
+        print(f"force_key                            : {cfg.force_key}")
+        print(f"force_loss_strength                  : {cfg.force_loss_strength:.3e}")
+        print(f"force_components                     : {cfg.force_components}")
+        print(f"force_sign                           : {cfg.force_sign:g}")
         print("=" * 100)
 
     try:
-        model, train_hist, valid_hist = train_model(
+        train_result = train_model(
             properties=properties,
             model_cls=spec.model_cls,
             params=params,
             train_file=train_file,
             valid_file=valid_file,
+            force_key=cfg.force_key,
             n_epochs=cfg.n_epochs,
             lr=cfg.lr,
             valid_every=cfg.valid_every,
@@ -350,7 +411,30 @@ def run_one_max_dlambda_case(
             abs_tol=cfg.abs_tol,
             rel_tol=cfg.rel_tol,
             fail_on_nonconvergence=cfg.train_fail_on_nonconvergence,
+            hessian_reg_strength=cfg.hessian_reg_strength,
+            hessian_reg_probes=cfg.hessian_reg_probes,
+            hessian_reg_seed=cfg.hessian_reg_seed,
+            force_loss_strength=cfg.force_loss_strength,
+            force_components=cfg.force_components,
+            force_sign=cfg.force_sign,
+            return_loss_components=cfg.return_loss_components,
         )
+        if cfg.return_loss_components:
+            (
+                model,
+                train_hist,
+                valid_hist,
+                train_displacement_hist,
+                train_force_hist,
+                valid_displacement_hist,
+                valid_force_hist,
+            ) = train_result
+        else:
+            model, train_hist, valid_hist = train_result
+            train_displacement_hist = None
+            train_force_hist = None
+            valid_displacement_hist = None
+            valid_force_hist = None
     except Exception as exc:
         failure_reason = f"training_{_classify_exception(exc)}"
         _write_json(os.path.join(exp_dir, "failure.json"), {"success": False, "failure_reason": failure_reason})
@@ -368,8 +452,8 @@ def run_one_max_dlambda_case(
 
     try:
         base, aux = get_slinky(properties)
-        train_data = Dataset.load(train_file)
-        valid_data = Dataset.load(valid_file)
+        train_data = Dataset.load(train_file, force_key=cfg.force_key)
+        valid_data = Dataset.load(valid_file, force_key=cfg.force_key)
         train_pred = predict(
             model,
             base,
@@ -431,6 +515,10 @@ def run_one_max_dlambda_case(
             valid_pred,
             train_data,
             valid_data,
+            train_displacement_hist=train_displacement_hist,
+            train_force_hist=train_force_hist,
+            valid_displacement_hist=valid_displacement_hist,
+            valid_force_hist=valid_force_hist,
         )
 
     return _make_record(

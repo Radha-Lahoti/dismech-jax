@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 
-from util import Dataset, get_slinky, predict, train_model
+from util_with_force_loss import Dataset, get_slinky, predict, train_model
 from architecture_plots import (
     plot_baseline_stiffness_history,
     plot_loss_curves,
@@ -141,7 +141,7 @@ class SweepConfig:
     lr: float = 1e-2
     seed: int = 0
 
-    # solver / training-loop compatibility with new util.py
+    # solver / training-loop compatibility with the training utilities
     valid_every: int = 1
     max_dlambda: float = 1e-2
     iters: int = 5
@@ -155,10 +155,17 @@ class SweepConfig:
     prediction_fail_on_nonconvergence: bool = False
     fail_on_nonconvergence: Optional[bool] = None  # legacy alias for training
 
-    # Optional Hessian spectral regularizer in util.py.
+    # Optional Hessian spectral regularizer.
     hessian_reg_strength: float = 0.0
     hessian_reg_probes: int = 1
     hessian_reg_seed: int = 0
+
+    # Optional reaction-force loss in util_with_force_loss.py.
+    force_key: Optional[str] = None
+    force_loss_strength: float = 0.0
+    force_components: tuple[int, ...] = (0, 1, 2)
+    force_sign: float = 1.0
+    return_loss_components: bool = False
 
     output_dir: str = "arch_sweep_outputs"
     save_npz: bool = True
@@ -257,6 +264,13 @@ def experiment_name(spec: ArchSpec, cfg: SweepConfig) -> str:
             f"__hreg_{cfg.hessian_reg_strength:g}"
             f"__hprobe_{cfg.hessian_reg_probes}"
             f"__hseed_{cfg.hessian_reg_seed}"
+        )
+    if cfg.force_loss_strength != 0.0:
+        comps = "-".join(str(c) for c in cfg.force_components)
+        name += (
+            f"__floss_{cfg.force_loss_strength:g}"
+            f"__fcomp_{comps}"
+            f"__fsign_{cfg.force_sign:g}"
         )
     return name
 
@@ -401,6 +415,10 @@ def save_results_npz(
     baseline_history_epochs=None,
     baseline_history_values=None,
     baseline_history_labels=None,
+    train_displacement_hist=None,
+    train_force_hist=None,
+    valid_displacement_hist=None,
+    valid_force_hist=None,
 ):
     save_dict = dict(
         arch_name=spec.name,
@@ -428,6 +446,10 @@ def save_results_npz(
         hessian_reg_strength=float(cfg.hessian_reg_strength),
         hessian_reg_probes=int(cfg.hessian_reg_probes),
         hessian_reg_seed=int(cfg.hessian_reg_seed),
+        force_key="" if cfg.force_key is None else cfg.force_key,
+        force_loss_strength=float(cfg.force_loss_strength),
+        force_components=np.asarray(cfg.force_components, dtype=int),
+        force_sign=float(cfg.force_sign),
         train_hist=np.asarray(train_hist, dtype=float),
         valid_hist=np.asarray(valid_hist, dtype=float),
         train_pred=np.asarray(train_pred, dtype=float),
@@ -444,6 +466,14 @@ def save_results_npz(
         save_dict["baseline_history_values"] = np.asarray(baseline_history_values, dtype=float)
     if baseline_history_labels is not None and len(baseline_history_labels) > 0:
         save_dict["baseline_history_labels"] = np.asarray(baseline_history_labels, dtype=str)
+    if train_displacement_hist is not None:
+        save_dict["train_displacement_hist"] = np.asarray(train_displacement_hist, dtype=float)
+    if train_force_hist is not None:
+        save_dict["train_force_hist"] = np.asarray(train_force_hist, dtype=float)
+    if valid_displacement_hist is not None:
+        save_dict["valid_displacement_hist"] = np.asarray(valid_displacement_hist, dtype=float)
+    if valid_force_hist is not None:
+        save_dict["valid_force_hist"] = np.asarray(valid_force_hist, dtype=float)
 
     np.savez(os.path.join(exp_dir, "results.npz"), **save_dict)
 
@@ -488,6 +518,10 @@ def run_one_architecture(
         print(f"  hessian_reg_strength    : {cfg.hessian_reg_strength}")
         print(f"  hessian_reg_probes      : {cfg.hessian_reg_probes}")
         print(f"  hessian_reg_seed        : {cfg.hessian_reg_seed}")
+        print(f"  force_key               : {cfg.force_key}")
+        print(f"  force_loss_strength     : {cfg.force_loss_strength}")
+        print(f"  force_components        : {cfg.force_components}")
+        print(f"  force_sign              : {cfg.force_sign}")
         print(f"  exp_dir                 : {exp_dir}")
         if cfg.save_energy_landscapes:
             print(f"  energy snapshots        : initial={cfg.energy_snapshot_initial}, final={cfg.energy_snapshot_final}, epochs={cfg.energy_snapshot_epochs}, every={cfg.energy_snapshot_every}")
@@ -519,12 +553,13 @@ def run_one_architecture(
         # -------------------------
         # Train
         # -------------------------
-        model, train_hist, valid_hist = train_model(
+        train_result = train_model(
             properties=properties,
             model_cls=spec.model_cls,
             params=params,
             train_file=train_file,
             valid_file=valid_file,
+            force_key=cfg.force_key,
             n_epochs=cfg.n_epochs,
             lr=cfg.lr,
             snapshot_fn=snapshot_fn,
@@ -542,14 +577,34 @@ def run_one_architecture(
             hessian_reg_strength=cfg.hessian_reg_strength,
             hessian_reg_probes=cfg.hessian_reg_probes,
             hessian_reg_seed=cfg.hessian_reg_seed,
+            force_loss_strength=cfg.force_loss_strength,
+            force_components=cfg.force_components,
+            force_sign=cfg.force_sign,
+            return_loss_components=cfg.return_loss_components,
         )
+        if cfg.return_loss_components:
+            (
+                model,
+                train_hist,
+                valid_hist,
+                train_displacement_hist,
+                train_force_hist,
+                valid_displacement_hist,
+                valid_force_hist,
+            ) = train_result
+        else:
+            model, train_hist, valid_hist = train_result
+            train_displacement_hist = None
+            train_force_hist = None
+            valid_displacement_hist = None
+            valid_force_hist = None
 
         # -------------------------
         # Predict
         # -------------------------
         base, aux = get_slinky(properties)
-        train_data = Dataset.load(train_file)
-        valid_data = Dataset.load(valid_file)
+        train_data = Dataset.load(train_file, force_key=cfg.force_key)
+        valid_data = Dataset.load(valid_file, force_key=cfg.force_key)
 
         train_pred = predict(
             model, base, aux,
@@ -598,6 +653,10 @@ def run_one_architecture(
                 baseline_history_epochs=baseline_history_epochs,
                 baseline_history_values=baseline_history_values,
                 baseline_history_labels=baseline_history_labels,
+                train_displacement_hist=train_displacement_hist,
+                train_force_hist=train_force_hist,
+                valid_displacement_hist=valid_displacement_hist,
+                valid_force_hist=valid_force_hist,
             )
 
         # -------------------------
@@ -668,6 +727,10 @@ def run_one_architecture(
             "model": model,
             "train_hist": np.asarray(train_hist, dtype=float),
             "valid_hist": np.asarray(valid_hist, dtype=float),
+            "train_displacement_hist": None if train_displacement_hist is None else np.asarray(train_displacement_hist, dtype=float),
+            "train_force_hist": None if train_force_hist is None else np.asarray(train_force_hist, dtype=float),
+            "valid_displacement_hist": None if valid_displacement_hist is None else np.asarray(valid_displacement_hist, dtype=float),
+            "valid_force_hist": None if valid_force_hist is None else np.asarray(valid_force_hist, dtype=float),
             "train_pred": np.asarray(train_pred, dtype=float),
             "valid_pred": np.asarray(valid_pred, dtype=float),
             "train_truth": np.asarray(train_data.qs),
@@ -711,6 +774,10 @@ def run_one_architecture(
             "model": None,
             "train_hist": np.array([np.nan]),
             "valid_hist": np.array([np.nan]),
+            "train_displacement_hist": None,
+            "train_force_hist": None,
+            "valid_displacement_hist": None,
+            "valid_force_hist": None,
             "train_pred": None,
             "valid_pred": None,
             "train_truth": None,
@@ -771,6 +838,10 @@ def run_architecture_sweep(
                 "model": None,
                 "train_hist": np.array([np.nan]),
                 "valid_hist": np.array([np.nan]),
+                "train_displacement_hist": None,
+                "train_force_hist": None,
+                "valid_displacement_hist": None,
+                "valid_force_hist": None,
                 "train_pred": None,
                 "valid_pred": None,
                 "train_truth": None,

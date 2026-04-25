@@ -24,7 +24,9 @@ class Dataset(eqx.Module):
     def load(path, force_key=None):
         data = np.load(path)
         forces = None
-        if force_key is not None:
+        if force_key is False:
+            forces = None
+        elif force_key is not None:
             forces = jnp.asarray(data[force_key])
         else:
             for key in ("F", "forces", "force", "reaction_forces", "reaction_force"):
@@ -361,6 +363,57 @@ def traj_loss(
     force_components=(0, 1, 2),
     force_sign=1.0,
 ):
+    total_loss, _, _ = traj_loss_components(
+        model,
+        base,
+        aux,
+        idx_b,
+        xb,
+        lambdas,
+        qs_true,
+        valid,
+        force_true=force_true,
+        max_dlambda=max_dlambda,
+        iters=iters,
+        ls_steps=ls_steps,
+        abs_tol=abs_tol,
+        rel_tol=rel_tol,
+        fail_on_nonconvergence=fail_on_nonconvergence,
+        early_stop=early_stop,
+        hessian_reg_strength=hessian_reg_strength,
+        hessian_reg_key=hessian_reg_key,
+        hessian_reg_probes=hessian_reg_probes,
+        force_loss_strength=force_loss_strength,
+        force_components=force_components,
+        force_sign=force_sign,
+    )
+    return total_loss
+
+
+def traj_loss_components(
+    model,
+    base,
+    aux,
+    idx_b,
+    xb,
+    lambdas,
+    qs_true,
+    valid,
+    force_true=None,
+    max_dlambda=5e-3,
+    iters=5,
+    ls_steps=10,
+    abs_tol=1e-8,
+    rel_tol=1e-6,
+    fail_on_nonconvergence=False,
+    early_stop=False,
+    hessian_reg_strength=0.0,
+    hessian_reg_key=None,
+    hessian_reg_probes=1,
+    force_loss_strength=1.0,
+    force_components=(0, 1, 2),
+    force_sign=1.0,
+):
     if force_true is None:
         qs_true, xb, lambdas, valid = _move_valid_prefix(qs_true, xb, lambdas, valid)
     else:
@@ -389,9 +442,11 @@ def traj_loss(
     )
     err = (qs_pred - qs_true) ** 2
     masked_err = jnp.where(valid[..., None], err, 0.0)
-    mse = jnp.sum(masked_err) / jnp.sum(valid)
+    displacement_mse = jnp.sum(masked_err) / jnp.sum(valid)
+    force_mse = jnp.asarray(0.0, dtype=displacement_mse.dtype)
+    total_loss = displacement_mse
 
-    if force_true is not None and force_loss_strength != 0.0:
+    if force_true is not None:
         force_mse = reaction_force_loss(
             model,
             base,
@@ -404,10 +459,10 @@ def traj_loss(
             force_components=force_components,
             force_sign=force_sign,
         )
-        mse = mse + force_loss_strength * force_mse
+        total_loss = total_loss + force_loss_strength * force_mse
 
     if hessian_reg_strength == 0.0:
-        return mse
+        return total_loss, displacement_mse, force_mse
 
     hessian_reg = energy_hessian_spectral_regularizer(
         model,
@@ -419,10 +474,52 @@ def traj_loss(
         hessian_reg_key,
         n_probes=hessian_reg_probes,
     )
-    return mse + hessian_reg_strength * hessian_reg
+    total_loss = total_loss + hessian_reg_strength * hessian_reg
+    return total_loss, displacement_mse, force_mse
 
 
 def dataset_loss(
+    model,
+    base,
+    aux,
+    data: Dataset,
+    max_dlambda=5e-3,
+    iters=5,
+    ls_steps=10,
+    abs_tol=1e-8,
+    rel_tol=1e-6,
+    fail_on_nonconvergence=False,
+    early_stop=False,
+    hessian_reg_strength=0.0,
+    hessian_reg_key=None,
+    hessian_reg_probes=1,
+    force_loss_strength=1.0,
+    force_components=(0, 1, 2),
+    force_sign=1.0,
+):
+    total_loss, _, _ = dataset_loss_components(
+        model,
+        base,
+        aux,
+        data,
+        max_dlambda=max_dlambda,
+        iters=iters,
+        ls_steps=ls_steps,
+        abs_tol=abs_tol,
+        rel_tol=rel_tol,
+        fail_on_nonconvergence=fail_on_nonconvergence,
+        early_stop=early_stop,
+        hessian_reg_strength=hessian_reg_strength,
+        hessian_reg_key=hessian_reg_key,
+        hessian_reg_probes=hessian_reg_probes,
+        force_loss_strength=force_loss_strength,
+        force_components=force_components,
+        force_sign=force_sign,
+    )
+    return total_loss
+
+
+def dataset_loss_components(
     model,
     base,
     aux,
@@ -460,8 +557,8 @@ def dataset_loss(
     reg_keys = jax.random.split(hessian_reg_key, n_traj)
 
     if data.forces is None:
-        losses = jax.vmap(
-            lambda ib, xb, qs, lam, valid, reg_key: traj_loss(
+        losses, displacement_losses, force_losses = jax.vmap(
+            lambda ib, xb, qs, lam, valid, reg_key: traj_loss_components(
                 model,
                 base,
                 aux,
@@ -486,8 +583,8 @@ def dataset_loss(
             )
         )(idx_all, data.xb, data.qs, lam_all, data.valid, reg_keys)
     else:
-        losses = jax.vmap(
-            lambda ib, xb, qs, lam, valid, force, reg_key: traj_loss(
+        losses, displacement_losses, force_losses = jax.vmap(
+            lambda ib, xb, qs, lam, valid, force, reg_key: traj_loss_components(
                 model,
                 base,
                 aux,
@@ -513,7 +610,7 @@ def dataset_loss(
             )
         )(idx_all, data.xb, data.qs, lam_all, data.valid, data.forces, reg_keys)
 
-    return jnp.mean(losses)
+    return jnp.mean(losses), jnp.mean(displacement_losses), jnp.mean(force_losses)
 
 # =========================================================
 # Training
@@ -550,11 +647,13 @@ def train_model(
     early_stopping_patience=None,
     early_stopping_min_delta=0.0,
     restore_best_model=True,
+    return_loss_components=False,
 ):
     # --- setup ---
     base, aux = get_slinky(properties)
-    train = Dataset.load(train_file, force_key=force_key)
-    valid = Dataset.load(valid_file, force_key=force_key)
+    train_force_key = force_key if (force_loss_strength != 0.0 or return_loss_components) else False
+    train = Dataset.load(train_file, force_key=train_force_key)
+    valid = Dataset.load(valid_file, force_key=train_force_key)
     validate_dataset_compatibility(base, train, "train")
     validate_dataset_compatibility(base, valid, "valid")
 
@@ -592,8 +691,8 @@ def train_model(
     # --- training step ---
     @eqx.filter_jit
     def step(model, opt_state, reg_key):
-        loss, grads = eqx.filter_value_and_grad(
-            lambda m: dataset_loss(
+        def loss_with_aux(m):
+            loss, displacement_loss, force_loss = dataset_loss_components(
                 m,
                 base,
                 aux,
@@ -612,17 +711,28 @@ def train_model(
                 force_components=force_components,
                 force_sign=force_sign,
             )
+            return loss, (displacement_loss, force_loss)
+
+        (loss, (displacement_loss, force_loss)), grads = eqx.filter_value_and_grad(
+            loss_with_aux,
+            has_aux=True,
         )(model)
 
         updates, opt_state = opt.update(grads, opt_state, model)
         model = eqx.apply_updates(model, updates)
 
-        return model, opt_state, loss
+        return model, opt_state, loss, displacement_loss, force_loss
 
     train_hist = []
     valid_hist = []
+    train_displacement_hist = []
+    train_force_hist = []
+    valid_displacement_hist = []
+    valid_force_hist = []
 
     last_val_loss = jnp.nan
+    last_val_displacement_loss = jnp.nan
+    last_val_force_loss = jnp.nan
     best_model = model
     best_val_loss = jnp.inf
     best_epoch = -1
@@ -651,15 +761,25 @@ def train_model(
 
     for i in range(n_epochs):
         hessian_reg_key, step_reg_key = jax.random.split(hessian_reg_key)
-        model, opt_state, train_loss = step(model, opt_state, step_reg_key)
+        model, opt_state, train_loss, train_displacement_loss, train_force_loss = step(
+            model,
+            opt_state,
+            step_reg_key,
+        )
         train_hist.append(train_loss)
+        train_displacement_hist.append(train_displacement_loss)
+        train_force_hist.append(train_force_loss)
 
         do_valid = (valid_every is not None) and (
             (i % valid_every == 0) or (i == n_epochs - 1)
         )
 
         if do_valid:
-            last_val_loss = dataset_loss(
+            (
+                last_val_loss,
+                last_val_displacement_loss,
+                last_val_force_loss,
+            ) = dataset_loss_components(
                 model,
                 base,
                 aux,
@@ -686,11 +806,15 @@ def train_model(
                 epochs_without_improvement += valid_every
 
         valid_hist.append(last_val_loss)
+        valid_displacement_hist.append(last_val_displacement_loss)
+        valid_force_hist.append(last_val_force_loss)
 
         if i % 100 == 0:
             print(
                 f"Epoch {i:03d} | Train: {float(train_loss):.3e} | "
-                f"Valid: {float(last_val_loss):.3e}"
+                f"Valid: {float(last_val_loss):.3e} | "
+                f"Disp: {float(train_displacement_loss):.3e} | "
+                f"Force: {float(train_force_loss):.3e}"
             )
 
         # optional snapshot hook
@@ -735,6 +859,17 @@ def train_model(
 
     if restore_best_model and best_epoch >= 0:
         model = best_model
+
+    if return_loss_components:
+        return (
+            model,
+            train_hist,
+            valid_hist,
+            train_displacement_hist,
+            train_force_hist,
+            valid_displacement_hist,
+            valid_force_hist,
+        )
 
     return model, train_hist, valid_hist
 

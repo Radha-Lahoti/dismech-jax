@@ -34,6 +34,25 @@ def _final_or_nan(hist):
     return float(arr[-1])
 
 
+def _history_key(which: str) -> str:
+    aliases = {
+        "train": "train_hist",
+        "valid": "valid_hist",
+        "train_displacement": "train_displacement_hist",
+        "valid_displacement": "valid_displacement_hist",
+        "train_force": "train_force_hist",
+        "valid_force": "valid_force_hist",
+    }
+    if which not in aliases:
+        raise ValueError(f"which must be one of {tuple(aliases)}")
+    return aliases[which]
+
+
+def _has_history(seed_results: list[dict], which: str) -> bool:
+    key = _history_key(which)
+    return any(r.get(key, None) is not None for r in seed_results)
+
+
 def _trajectory_valid_mask(result: dict, split: str, traj_idx: int, length: int) -> np.ndarray:
     mask_key = f"{split}_valid_mask"
     if mask_key not in result or result[mask_key] is None:
@@ -226,6 +245,22 @@ def get_seed_summary(seed_results: list[dict]) -> dict:
 
     final_train = np.array([_final_or_nan(r.get("train_hist", None)) for r in seed_results], dtype=float)
     final_valid = np.array([_final_or_nan(r.get("valid_hist", None)) for r in seed_results], dtype=float)
+    final_train_displacement = np.array(
+        [_final_or_nan(r.get("train_displacement_hist", None)) for r in seed_results],
+        dtype=float,
+    )
+    final_valid_displacement = np.array(
+        [_final_or_nan(r.get("valid_displacement_hist", None)) for r in seed_results],
+        dtype=float,
+    )
+    final_train_force = np.array(
+        [_final_or_nan(r.get("train_force_hist", None)) for r in seed_results],
+        dtype=float,
+    )
+    final_valid_force = np.array(
+        [_final_or_nan(r.get("valid_force_hist", None)) for r in seed_results],
+        dtype=float,
+    )
 
     successful = _successful_results(seed_results)
 
@@ -280,6 +315,10 @@ def get_seed_summary(seed_results: list[dict]) -> dict:
         "seeds": seeds,
         "final_train": final_train,
         "final_valid": final_valid,
+        "final_train_displacement": final_train_displacement,
+        "final_valid_displacement": final_valid_displacement,
+        "final_train_force": final_train_force,
+        "final_valid_force": final_valid_force,
         "best_seed": best_seed,
         "best_result": best_success_result,
         "mean_final_train": mean_final_train,
@@ -313,6 +352,10 @@ def print_seed_summary(all_seed_results: dict):
         print(f"  median final valid: {s['median_final_valid']:.6e}")
         print(f"  mean final train  : {s['mean_final_train']:.6e}")
         print(f"  std  final train  : {s['std_final_train']:.6e}")
+        if np.any(np.isfinite(s["final_valid_displacement"])):
+            print(f"  mean valid disp   : {np.nanmean(s['final_valid_displacement']):.6e}")
+        if np.any(np.isfinite(s["final_valid_force"])):
+            print(f"  mean valid force  : {np.nanmean(s['final_valid_force']):.6e}")
 
         if s["n_failed"] > 0:
             print("  failed seeds      :")
@@ -334,6 +377,18 @@ def save_seed_summary_json(all_seed_results: dict, output_dir: str):
             "success_mask": [bool(x) for x in s["success_mask"]],
             "final_train": [float(x) if np.isfinite(x) else None for x in s["final_train"]],
             "final_valid": [float(x) if np.isfinite(x) else None for x in s["final_valid"]],
+            "final_train_displacement": [
+                float(x) if np.isfinite(x) else None for x in s["final_train_displacement"]
+            ],
+            "final_valid_displacement": [
+                float(x) if np.isfinite(x) else None for x in s["final_valid_displacement"]
+            ],
+            "final_train_force": [
+                float(x) if np.isfinite(x) else None for x in s["final_train_force"]
+            ],
+            "final_valid_force": [
+                float(x) if np.isfinite(x) else None for x in s["final_valid_force"]
+            ],
             "best_seed": None if s["best_seed"] is None else int(s["best_seed"]),
             "mean_final_train": None if not np.isfinite(s["mean_final_train"]) else float(s["mean_final_train"]),
             "std_final_train": None if not np.isfinite(s["std_final_train"]) else float(s["std_final_train"]),
@@ -357,10 +412,9 @@ def plot_seed_loss_envelope(
     save_path: Optional[str] = None,
     title: Optional[str] = None,
     show: bool = False,
-    which: str = "valid",   # "train" or "valid"
+    which: str = "valid",
 ):
-    if which not in ("train", "valid"):
-        raise ValueError("which must be 'train' or 'valid'")
+    hist_key = _history_key(which)
 
     good_results = _successful_results(seed_results)
     if len(good_results) == 0:
@@ -371,8 +425,14 @@ def plot_seed_loss_envelope(
     seeds = []
 
     for r in good_results:
-        losses.append(r[f"{which}_hist"])
+        if r.get(hist_key, None) is None:
+            continue
+        losses.append(r[hist_key])
         seeds.append(r["cfg"].seed)
+
+    if len(losses) == 0:
+        print(f"[plot_seed_loss_envelope] No {which} histories available. Skipping plot.")
+        return
 
     losses = np.asarray(losses, dtype=float)
     seeds = np.asarray(seeds, dtype=int)
@@ -404,7 +464,8 @@ def plot_seed_loss_envelope(
 
     ax.set_yscale("log")
     ax.set_xlabel("Epoch")
-    ax.set_ylabel(f"{which.capitalize()} MSE loss")
+    label = which.replace("_", " ").capitalize()
+    ax.set_ylabel(f"{label} MSE loss")
     ax.set_title(title if title is not None else f"{which.capitalize()} loss across seeds")
     ax.grid(True, alpha=0.25)
     ax.legend()
@@ -786,6 +847,21 @@ def make_seed_ablation_plots(
             title=f"{arch_name} | valid loss across seeds",
             show=False,
         )
+
+        for which, filename, title_suffix in (
+            ("train_displacement", "train_displacement_loss_across_seeds.png", "train displacement"),
+            ("valid_displacement", "valid_displacement_loss_across_seeds.png", "valid displacement"),
+            ("train_force", "train_force_loss_across_seeds.png", "train force"),
+            ("valid_force", "valid_force_loss_across_seeds.png", "valid force"),
+        ):
+            if _has_history(seed_results, which):
+                plot_seed_loss_envelope(
+                    seed_results,
+                    which=which,
+                    save_path=os.path.join(arch_dir, filename),
+                    title=f"{arch_name} | {title_suffix} loss across seeds",
+                    show=False,
+                )
 
         for component in ("x", "z"):
             plot_seed_prediction_envelope(
