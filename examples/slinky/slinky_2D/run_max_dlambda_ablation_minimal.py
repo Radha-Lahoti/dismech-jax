@@ -17,7 +17,7 @@ from Energy_NN_architectures import (
     ModelParams,
     ScalarEnergyNN,
 )
-from util_with_force_loss import Dataset, get_slinky, predict, train_model
+from util import Dataset, get_slinky, predict, train_model
 
 
 @dataclass(frozen=True)
@@ -94,8 +94,8 @@ class MaxDlambdaAblationConfig:
     seed_list: tuple[int, ...] = (0,)
     valid_every: int = 1
 
-    max_dlambda_values: tuple[float, ...] = (1e-2, 5e-2, 1e-1, 5e-1, 1.0)
-    iters: int = 10
+    max_dlambda_values: tuple[float, ...] = (1e-3, 5e-3, 1e-2, 5e-2, 1e-1, 5e-1, 1.0)
+    iters: int = 20
     ls_steps: int = 10
     abs_tol: float = 1e-8
     rel_tol: float = 1e-6

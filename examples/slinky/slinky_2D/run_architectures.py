@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 
-from util_with_force_loss import Dataset, get_slinky, predict, train_model
+from util import Dataset, get_slinky, predict, train_model
 from architecture_plots import (
     plot_baseline_stiffness_history,
     plot_loss_curves,
@@ -161,7 +161,7 @@ class SweepConfig:
     hessian_reg_probes: int = 1
     hessian_reg_seed: int = 0
 
-    # Optional reaction-force loss in util_with_force_loss.py.
+    # Optional reaction-force loss in util.py.
     force_key: Optional[str] = None
     force_loss_strength: float = 0.0
     force_components: tuple[int, ...] = (0, 1, 2)
