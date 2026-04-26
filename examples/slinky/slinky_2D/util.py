@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import equinox as eqx
 import optax
 import numpy as np
+import warnings
 import dismech_jax as djx
 from dismech_jax.solver import update_aux_state
 
@@ -56,11 +57,20 @@ def get_slinky(properties):
             material=mat,
             N=properties.N,
         )
-    else:
+    elif properties.length is not None:
         rod, aux = djx.Rod.from_geometry(geom, mat, N=properties.N)
+    else:
+        raise ValueError("Either length or start/end points must be specified")
 
     if properties.mass is not None:
         mass = properties.mass
+        if mass <= 0.0:
+            warnings.warn(
+                "Mass is non-positive; if this is because gravity is in +z, ignore, "
+                "but if this is not the intention please correct.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         N = properties.N
         assert N >= 2
 
@@ -203,7 +213,7 @@ def traj_loss(
     abs_tol=1e-8,
     rel_tol=1e-6,
     fail_on_nonconvergence=False,
-    early_stop=False,
+    early_stop=True,
     hessian_reg_strength=0.0,
     hessian_reg_key=None,
     hessian_reg_probes=1,
@@ -327,7 +337,7 @@ def train_model(
     abs_tol=1e-4,
     rel_tol=1e-4,
     fail_on_nonconvergence=False,
-    early_stop=False,
+    early_stop=True,
     hessian_reg_strength=0.0,
     hessian_reg_probes=1,
     hessian_reg_seed=0,

@@ -109,12 +109,16 @@ def get_slinky(properties):
         g = -9.81
         f = jnp.zeros(4 * N - 1)
 
-        # set all node z entries as interior-node weights first
-        f = f.at[2::4].set(mass / (N - 1) * g)
+        # # set all node z entries as interior-node weights first
+        # f = f.at[2::4].set(mass / (N - 1) * g)
 
-        # correct the two end nodes to half-weight
-        f = f.at[2].set(mass / (2 * (N - 1)) * g)      # first node z
-        f = f.at[4 * N - 2].set(mass / (2 * (N - 1)) * g)  # last node z
+        # # correct the two end nodes to half-weight
+        # f = f.at[2].set(mass / (2 * (N - 1)) * g)      # first node z
+        # f = f.at[4 * N - 2].set(mass / (2 * (N - 1)) * g)  # last node z
+
+        # distribute mass evenly to all nodes
+        f = f.at[2::4].set(mass / N * g)
+        
         rod = eqx.tree_at(lambda r: r.E_ext, rod, djx.Gravity(f))
 
     return rod, aux
@@ -811,10 +815,13 @@ def train_model(
 
         if i % 100 == 0:
             print(
-                f"Epoch {i:03d} | Train: {float(train_loss):.3e} | "
-                f"Valid: {float(last_val_loss):.3e} | "
-                f"Disp: {float(train_displacement_loss):.3e} | "
-                f"Force: {float(train_force_loss):.3e}"
+                f"Epoch {i:03d} | "
+                f"Train total: {float(train_loss):.3e} | "
+                f"Train disp: {float(train_displacement_loss):.3e} | "
+                f"Train force: {float(train_force_loss):.3e} | "
+                f"Valid total: {float(last_val_loss):.3e} | "
+                f"Valid disp: {float(last_val_displacement_loss):.3e} | "
+                f"Valid force: {float(last_val_force_loss):.3e}"
             )
 
         # optional snapshot hook

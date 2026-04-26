@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import jax
 
@@ -62,3 +62,14 @@ class TapeN7Properties(Properties):
     density: float = 600.0
     E: float = 1e6
     N: int = 7
+
+@dataclass
+class TapeN11Properties(Properties):
+    # length: float = 1.2
+    start: jax.Array = field(default_factory=lambda: jax.numpy.array([0.0, 0.0, 0.0]))
+    end: jax.Array = field(default_factory=lambda: jax.numpy.array([1.05660479, 0.0, 0.04239192]))
+    r0: float = 0.005
+    density: float = 600.0
+    E: float = 1e6
+    N: int = 11
+    mass: float = 0.001

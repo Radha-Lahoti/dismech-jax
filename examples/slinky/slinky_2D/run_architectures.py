@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace, asdict, field
 from typing import Optional
 
 import numpy as np
+import matplotlib.pyplot as plt
 
 import jax
 import jax.numpy as jnp

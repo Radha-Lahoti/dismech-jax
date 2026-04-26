@@ -872,19 +872,19 @@ class CholeskyPlusStiffnessSignedNN(eqx.Module, _CholeskyBase):
 ## Brazier's effect:
 # ===================================================================================== #
 # 6) StructuredBrazierCholeskyEnergyNN
-#     Full 5-strain energy with explicit Brazier softening in kappa1
-#     del_strain = [eps0, eps1, kappa0, kappa1, tau]
+#     Reduced 3-strain energy with explicit Brazier softening in kappa1
+#     del_strain = [eps0, eps1, kappa1]
 # ===================================================================================== #
 
-def _vec_to_lower_triangular_5(p: jax.Array) -> jax.Array:
-    """Map 15-vector to 5x5 lower-triangular matrix."""
+def _vec_to_lower_triangular_3(p: jax.Array) -> jax.Array:
+    """Map 6-vector to 3x3 lower-triangular matrix."""
     p = jnp.ravel(p)
-    if p.shape != (15,):
-        raise ValueError(f"Expected p shape (15,), got {p.shape}")
+    if p.shape != (6,):
+        raise ValueError(f"Expected p shape (6,), got {p.shape}")
 
-    L = jnp.zeros((5, 5))
+    L = jnp.zeros((3, 3))
     idx = 0
-    for i in range(5):
+    for i in range(3):
         for j in range(i + 1):
             if i == j:
                 L = L.at[i, j].set(jax.nn.softplus(p[idx]) + 1e-6)
@@ -894,38 +894,66 @@ def _vec_to_lower_triangular_5(p: jax.Array) -> jax.Array:
     return L
 
 
-def _full_strain_nn_input(
+def _reduced_strain_vector(
+    del_strain: jax.Array,
+) -> jax.Array:
+    del_strain = jnp.ravel(del_strain)
+    if del_strain.shape == (3,):
+        return del_strain
+
+    e0, e1, eb = get_reduced_strain_features(del_strain)
+    del_strain = jnp.array([e0, e1, eb])
+    if del_strain.shape != (3,):
+        raise ValueError(f"Expected reduced del_strain shape (3,), got {del_strain.shape}.")
+    return del_strain
+
+
+def _reduced_strain_nn_input(
     del_strain: jax.Array,
     input_mode: str,
     only_stretching_NN: bool,
     only_bending_NN: bool,
 ) -> jax.Array:
-    if only_stretching_NN or only_bending_NN:
-        return get_nn_input(
-            del_strain, input_mode, only_stretching_NN, only_bending_NN
-        )
+    del_strain = _reduced_strain_vector(del_strain)
+    e0, e1, eb = del_strain
 
-    del_strain = jnp.ravel(del_strain)
-    if del_strain.shape != (5,):
-        raise ValueError(f"Expected del_strain shape (5,), got {del_strain.shape}.")
-    return del_strain
+    if input_mode == "invariant":
+        if only_stretching_NN:
+            return jnp.array([e0**2 + e1**2])
+        if only_bending_NN:
+            return jnp.array([eb**2])
+        return jnp.array([e0**2 + e1**2, eb**2])
+    if input_mode == "raw":
+        if only_stretching_NN:
+            return jnp.array([e0, e1])
+        if only_bending_NN:
+            return jnp.array([eb])
+        return del_strain
+
+    raise ValueError("input_mode must be 'invariant' or 'raw'")
 
 
-def _full_strain_nn_in_features(
+def _reduced_strain_energy_from_K(
+    K: jax.Array,
+    del_strain: jax.Array,
+) -> jax.Array:
+    del_strain = _reduced_strain_vector(del_strain)
+    return 0.5 * del_strain @ K @ del_strain
+
+
+def _reduced_strain_nn_in_features(
     input_mode: str,
     only_stretching_NN: bool,
     only_bending_NN: bool,
 ) -> int:
-    if only_stretching_NN or only_bending_NN:
-        return _nn_in_features(input_mode, only_stretching_NN, only_bending_NN)
-    return 5
+    return _nn_in_features(input_mode, only_stretching_NN, only_bending_NN)
 
 
 class StructuredBrazierCholeskyEnergyNN(eqx.Module):
     """
     Energy model for strain vector
 
-        del_strain = [eps0, eps1, kappa0, kappa1, tau]
+        del_strain = [eps0, eps1, kappa1]
 
     The kappa1 stiffness softens exponentially after a learned critical curvature.
     In anisotropic mode, positive and negative bending directions have different
@@ -938,8 +966,8 @@ class StructuredBrazierCholeskyEnergyNN(eqx.Module):
     where K(eps) is PSD by construction.
     """
 
-    # Baseline diagonal stiffness for all 5 strain modes
-    K0_raw: jax.Array          # shape (5,)
+    # Baseline diagonal stiffness for all 3 reduced strain modes
+    K0_raw: jax.Array          # shape (3,)
 
     # Minimum retained stiffness ratio for kappa1 mode
     rho_min_raw: jax.Array     # scalar
@@ -982,10 +1010,10 @@ class StructuredBrazierCholeskyEnergyNN(eqx.Module):
         self.only_bending_NN = params.only_bending_NN
 
         der_K = jnp.ravel(params.der_K)
-        if der_K.shape != (5,):
+        if der_K.shape != (3,):
             raise ValueError(
                 "StructuredBrazierCholeskyEnergyNN expects params.der_K "
-                f"to have shape (5,), got {der_K.shape}."
+                f"to have shape (3,), got {der_K.shape}."
             )
 
         self.K0_raw = inv_softplus(jnp.maximum(der_K, 1e-8))
@@ -1003,17 +1031,17 @@ class StructuredBrazierCholeskyEnergyNN(eqx.Module):
             self.kappa_c_raw = inv_softplus(jnp.array([kappa_c_init]))
             self.alpha_raw = inv_softplus(jnp.array([alpha_init]))
 
-        # By default the NN sees the full 5D strain vector and outputs a 15-vector
-        # parameterizing a 5x5 PSD residual matrix. Single-mode flags make it see
+        # By default the NN sees the reduced 3D strain vector and outputs a 6-vector
+        # parameterizing a 3x3 PSD residual matrix. Single-mode flags make it see
         # only that mode's features and contribute only to that stiffness entry.
         self.residual_net = VectorNet(
             params.which_case if params.which_case in ("MLP", "ICNN") else "MLP",
-            in_features=_full_strain_nn_in_features(
+            in_features=_reduced_strain_nn_in_features(
                 params.input_mode, params.only_stretching_NN, params.only_bending_NN
             ),
             hidden=params.hidden,
             out_features=_stiffness_out_features(
-                15, params.only_stretching_NN, params.only_bending_NN
+                6, params.only_stretching_NN, params.only_bending_NN
             ),
             key=params.key,
             positive_output=False,
@@ -1076,18 +1104,14 @@ class StructuredBrazierCholeskyEnergyNN(eqx.Module):
 
         Only the kappa1 stiffness is softened explicitly.
         """
-        del_strain = jnp.ravel(del_strain)
-        if del_strain.shape != (5,):
-            raise ValueError(
-                f"Expected del_strain shape (5,), got {del_strain.shape}."
-            )
+        del_strain = _reduced_strain_vector(del_strain)
 
         K0 = self.get_K0()
-        kappa1 = del_strain[3]
+        kappa1 = del_strain[2]
 
         s = self.brazier_softening_factor(kappa1)
 
-        K_diag = K0.at[3].set(K0[3] * s)
+        K_diag = K0.at[2].set(K0[2] * s)
 
         return jnp.diag(K_diag)
 
@@ -1099,30 +1123,29 @@ class StructuredBrazierCholeskyEnergyNN(eqx.Module):
         dominant Brazier softening is imposed explicitly.
         """
         if self.which_case == "no_residual":
-            return jnp.zeros((5, 5))
+            return jnp.zeros((3, 3))
 
-        x = _full_strain_nn_input(
+        x = _reduced_strain_nn_input(
             del_strain, self.input_mode, self.only_stretching_NN, self.only_bending_NN
         )
         p = self.residual_net(x)
 
         if self.only_stretching_NN:
-            K = jnp.zeros((5, 5))
+            K = jnp.zeros((3, 3))
             return K.at[0, 0].set(jax.nn.softplus(self.corr_factor * p[0]))
         if self.only_bending_NN:
-            K = jnp.zeros((5, 5))
-            return K.at[3, 3].set(jax.nn.softplus(self.corr_factor * p[0]))
+            K = jnp.zeros((3, 3))
+            return K.at[2, 2].set(jax.nn.softplus(self.corr_factor * p[0]))
 
-        L = _vec_to_lower_triangular_5(self.corr_factor * p)
+        L = _vec_to_lower_triangular_3(self.corr_factor * p)
         return L @ L.T
 
     def get_K_matrix(self, del_strain: jax.Array) -> jax.Array:
         return self.get_structured_K(del_strain) + self.get_residual_K(del_strain)
 
     def __call__(self, del_strain: jax.Array) -> jax.Array:
-        del_strain = jnp.ravel(del_strain)
         K = self.get_K_matrix(del_strain)
-        return 0.5 * del_strain @ K @ del_strain
+        return _reduced_strain_energy_from_K(K, del_strain)
 
 
 # ===================================================================================== #
