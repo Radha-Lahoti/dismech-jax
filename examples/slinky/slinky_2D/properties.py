@@ -28,7 +28,7 @@ class SlinkyN3Properties(Properties):
     density: float = 800.0
     E: float = 1e6
     N: int = 3
-    mass: float = 0.05
+    mass: float = 0.2
 
 @dataclass
 class SlinkyN5Properties(Properties):
@@ -56,14 +56,6 @@ class TubeN7Properties(Properties):
     N: int = 7
 
 @dataclass
-class TapeN7Properties(Properties):
-    length: float = 0.7
-    r0: float = 0.005
-    density: float = 600.0
-    E: float = 1e6
-    N: int = 7
-
-@dataclass
 class TapeN11Properties(Properties):
     # length: float = 1.2
     start: jax.Array = field(default_factory=lambda: jax.numpy.array([0.0, 0.0, 0.0]))
@@ -72,4 +64,4 @@ class TapeN11Properties(Properties):
     density: float = 600.0
     E: float = 1e6
     N: int = 11
-    mass: float = 0.001
+    mass: float = 0.005

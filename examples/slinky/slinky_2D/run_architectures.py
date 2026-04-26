@@ -4,15 +4,15 @@ from dataclasses import dataclass, replace, asdict, field
 from typing import Optional
 
 import numpy as np
-import matplotlib.pyplot as plt
 
 import jax
 import jax.numpy as jnp
 import equinox as eqx
 
-from util import Dataset, get_slinky, predict, train_model
+from util import Dataset, get_slinky, predict, predict_reaction_force, train_model
 from architecture_plots import (
     plot_baseline_stiffness_history,
+    plot_force_prediction_vs_truth,
     plot_loss_curves,
     plot_prediction_vs_truth,
     plot_prediction_vs_truth_separate_components,
@@ -149,6 +149,7 @@ class SweepConfig:
     ls_steps: int = 10
     abs_tol: float = 1e-4
     rel_tol: float = 1e-4
+    early_stop: bool = True
     # Keep strict convergence checks during optimizer steps, while validation
     # loss inside util.train_model remains non-strict and prediction is
     # controlled separately below.
@@ -167,6 +168,24 @@ class SweepConfig:
     force_components: tuple[int, ...] = (0, 1, 2)
     force_sign: float = 1.0
     return_loss_components: bool = False
+
+    # Optimizer-level early stopping to reduce overfitting.
+    early_stopping: bool = True
+    early_stopping_patience: Optional[int] = 25
+    early_stopping_min_delta: float = 0.0
+    restore_best_model: bool = True
+
+    # Stored Hessian-path diagnostics for trained models. Prefer running these
+    # with compute_architecture_hessian_diagnostics.py after the sweep finishes.
+    save_hessian_diagnostics: bool = False
+    hessian_diagnostics_use_predicted: bool = False
+    hessian_diagnostics_splits: tuple[str, ...] = ("train", "valid")
+    hessian_diagnostics_max_trajectories: Optional[int] = 1
+    hessian_diagnostics_stride: int = 10
+
+    # Store and plot predicted reaction-force trajectories when force loss is active.
+    save_force_predictions: bool = True
+    plot_force_predictions: bool = True
 
     output_dir: str = "arch_sweep_outputs"
     save_npz: bool = True
@@ -286,11 +305,40 @@ def _classify_exception_message(msg: str) -> str:
     msg_low = msg.lower()
     if "did not converge" in msg_low or "nonconverge" in msg_low or "converge" in msg_low:
         return "convergence_failure"
+    if "nonfinite_training_history" in msg_low:
+        return "nonfinite_training_history"
     if "nan" in msg_low:
         return "nan_exception"
     if "inf" in msg_low:
         return "inf_exception"
     return f"exception: {msg}"
+
+
+def _history_has_nonfinite(hist) -> bool:
+    if hist is None:
+        return False
+    arr = np.asarray(hist, dtype=float)
+    return bool(arr.size > 0 and not np.all(np.isfinite(arr)))
+
+
+def _nonfinite_training_history_reason(**histories) -> Optional[str]:
+    bad_names = [name for name, hist in histories.items() if _history_has_nonfinite(hist)]
+    if len(bad_names) == 0:
+        return None
+    return "nonfinite_training_history: " + ",".join(bad_names)
+
+
+def _tree_has_nonfinite_numeric(tree) -> bool:
+    for leaf in jax.tree_util.tree_leaves(tree):
+        try:
+            arr = np.asarray(leaf)
+        except Exception:
+            continue
+        if not np.issubdtype(arr.dtype, np.inexact):
+            continue
+        if arr.size > 0 and not np.all(np.isfinite(arr)):
+            return True
+    return False
 
 
 def _train_fail_on_nonconvergence(cfg: SweepConfig) -> bool:
@@ -384,16 +432,97 @@ def _make_baseline_history_callback(model_cls):
     return callback, history_epochs, history_values, labels
 
 
+def _dataset_has_force_for_loss(cfg: SweepConfig, data: Dataset) -> bool:
+    return (
+        cfg.force_loss_strength != 0.0
+        and cfg.save_force_predictions
+        and data.forces is not None
+    )
+
+
+def _predict_dataset_reaction_forces(model, base, aux, data: Dataset, cfg: SweepConfig):
+    if data.forces is None:
+        return None
+
+    n_traj = data.qs.shape[0]
+    if data.idx_b.ndim == 1:
+        idx_all = jnp.broadcast_to(data.idx_b, (n_traj, data.idx_b.shape[0]))
+    else:
+        idx_all = data.idx_b
+
+    if data.lambdas.ndim == 1:
+        lambdas_all = jnp.broadcast_to(data.lambdas, (n_traj, data.lambdas.shape[0]))
+    else:
+        lambdas_all = data.lambdas
+
+    preds = []
+    for traj_idx in range(n_traj):
+        pred_force = predict_reaction_force(
+            model,
+            base,
+            aux,
+            lambdas_all[traj_idx],
+            data.qs[traj_idx],
+            idx_all[traj_idx],
+            data.valid[traj_idx],
+            force_components=cfg.force_components,
+            force_sign=cfg.force_sign,
+        )
+        force_true = data.forces[traj_idx]
+        if force_true.ndim == 1:
+            pred_force = pred_force[:, 0]
+        else:
+            n_force = min(force_true.shape[-1], pred_force.shape[-1])
+            pred_force = pred_force[:, :n_force]
+        preds.append(np.asarray(pred_force, dtype=float))
+
+    return np.stack(preds, axis=0)
+
+
 # =========================================================
 # 4) Saving helpers
 # =========================================================
-def save_config_json(cfg: SweepConfig, spec: ArchSpec, exp_dir: str):
+def _jsonable_value(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (tuple, list)):
+        return [_jsonable_value(v) for v in value]
+    try:
+        arr = np.asarray(value)
+        if arr.shape == ():
+            return arr.item()
+        return arr.tolist()
+    except Exception:
+        return repr(value)
+
+
+def _serialize_properties(properties) -> dict:
+    payload = {"class_name": properties.__class__.__name__}
+    for key, value in vars(properties).items():
+        payload[key] = _jsonable_value(value)
+    return payload
+
+
+def save_config_json(
+    cfg: SweepConfig,
+    spec: ArchSpec,
+    exp_dir: str,
+    properties=None,
+    train_file: Optional[str] = None,
+    valid_file: Optional[str] = None,
+):
     payload = asdict(cfg)
     payload["arch_name"] = spec.name
     payload["model_cls"] = spec.model_cls.__name__
     payload["which_case"] = spec.which_case
     payload["effective_train_fail_on_nonconvergence"] = _train_fail_on_nonconvergence(cfg)
     payload["validation_loss_fail_on_nonconvergence"] = False
+    if properties is not None:
+        payload["properties"] = _serialize_properties(properties)
+    if train_file is not None:
+        payload["train_file"] = os.path.abspath(train_file)
+    if valid_file is not None:
+        payload["valid_file"] = os.path.abspath(valid_file)
 
     with open(os.path.join(exp_dir, "config.json"), "w") as f:
         json.dump(payload, f, indent=2)
@@ -420,6 +549,10 @@ def save_results_npz(
     train_force_hist=None,
     valid_displacement_hist=None,
     valid_force_hist=None,
+    train_force_pred=None,
+    valid_force_pred=None,
+    train_force_truth=None,
+    valid_force_truth=None,
 ):
     save_dict = dict(
         arch_name=spec.name,
@@ -440,6 +573,7 @@ def save_results_npz(
         ls_steps=int(cfg.ls_steps),
         abs_tol=float(cfg.abs_tol),
         rel_tol=float(cfg.rel_tol),
+        early_stop=int(cfg.early_stop),
         train_fail_on_nonconvergence=int(_train_fail_on_nonconvergence(cfg)),
         validation_loss_fail_on_nonconvergence=0,
         prediction_fail_on_nonconvergence=int(cfg.prediction_fail_on_nonconvergence),
@@ -451,6 +585,12 @@ def save_results_npz(
         force_loss_strength=float(cfg.force_loss_strength),
         force_components=np.asarray(cfg.force_components, dtype=int),
         force_sign=float(cfg.force_sign),
+        early_stopping=int(cfg.early_stopping),
+        early_stopping_patience=-1 if cfg.early_stopping_patience is None else int(cfg.early_stopping_patience),
+        early_stopping_min_delta=float(cfg.early_stopping_min_delta),
+        restore_best_model=int(cfg.restore_best_model),
+        save_force_predictions=int(cfg.save_force_predictions),
+        plot_force_predictions=int(cfg.plot_force_predictions),
         train_hist=np.asarray(train_hist, dtype=float),
         valid_hist=np.asarray(valid_hist, dtype=float),
         train_pred=np.asarray(train_pred, dtype=float),
@@ -475,7 +615,12 @@ def save_results_npz(
         save_dict["valid_displacement_hist"] = np.asarray(valid_displacement_hist, dtype=float)
     if valid_force_hist is not None:
         save_dict["valid_force_hist"] = np.asarray(valid_force_hist, dtype=float)
-
+    if train_force_pred is not None and train_force_truth is not None:
+        save_dict["train_force_pred"] = np.asarray(train_force_pred, dtype=float)
+        save_dict["train_force_truth"] = np.asarray(train_force_truth, dtype=float)
+    if valid_force_pred is not None and valid_force_truth is not None:
+        save_dict["valid_force_pred"] = np.asarray(valid_force_pred, dtype=float)
+        save_dict["valid_force_truth"] = np.asarray(valid_force_truth, dtype=float)
     np.savez(os.path.join(exp_dir, "results.npz"), **save_dict)
 
 
@@ -513,9 +658,13 @@ def run_one_architecture(
         print(f"  ls_steps                : {cfg.ls_steps}")
         print(f"  abs_tol                 : {cfg.abs_tol}")
         print(f"  rel_tol                 : {cfg.rel_tol}")
+        print(f"  early_stop              : {cfg.early_stop}")
         print(f"  training fail_on_nonconvergence       : {_train_fail_on_nonconvergence(cfg)}")
         print("  validation loss fail_on_nonconvergence: False")
         print(f"  prediction fail_on_nonconvergence     : {cfg.prediction_fail_on_nonconvergence}")
+        print(f"  early_stopping          : {cfg.early_stopping}")
+        print(f"  early_stopping_patience : {cfg.early_stopping_patience}")
+        print(f"  restore_best_model      : {cfg.restore_best_model}")
         print(f"  hessian_reg_strength    : {cfg.hessian_reg_strength}")
         print(f"  hessian_reg_probes      : {cfg.hessian_reg_probes}")
         print(f"  hessian_reg_seed        : {cfg.hessian_reg_seed}")
@@ -523,6 +672,7 @@ def run_one_architecture(
         print(f"  force_loss_strength     : {cfg.force_loss_strength}")
         print(f"  force_components        : {cfg.force_components}")
         print(f"  force_sign              : {cfg.force_sign}")
+        print(f"  save_force_predictions  : {cfg.save_force_predictions}")
         print(f"  exp_dir                 : {exp_dir}")
         if cfg.save_energy_landscapes:
             print(f"  energy snapshots        : initial={cfg.energy_snapshot_initial}, final={cfg.energy_snapshot_final}, epochs={cfg.energy_snapshot_epochs}, every={cfg.energy_snapshot_every}")
@@ -575,12 +725,18 @@ def run_one_architecture(
             abs_tol=cfg.abs_tol,
             rel_tol=cfg.rel_tol,
             fail_on_nonconvergence=_train_fail_on_nonconvergence(cfg),
+            early_stop=cfg.early_stop,
             hessian_reg_strength=cfg.hessian_reg_strength,
             hessian_reg_probes=cfg.hessian_reg_probes,
             hessian_reg_seed=cfg.hessian_reg_seed,
             force_loss_strength=cfg.force_loss_strength,
             force_components=cfg.force_components,
             force_sign=cfg.force_sign,
+            early_stopping_patience=(
+                cfg.early_stopping_patience if cfg.early_stopping else None
+            ),
+            early_stopping_min_delta=cfg.early_stopping_min_delta,
+            restore_best_model=cfg.restore_best_model,
             return_loss_components=cfg.return_loss_components,
         )
         if cfg.return_loss_components:
@@ -600,6 +756,19 @@ def run_one_architecture(
             valid_displacement_hist = None
             valid_force_hist = None
 
+        nonfinite_reason = _nonfinite_training_history_reason(
+            train_hist=train_hist,
+            valid_hist=valid_hist,
+            train_displacement_hist=train_displacement_hist,
+            train_force_hist=train_force_hist,
+            valid_displacement_hist=valid_displacement_hist,
+            valid_force_hist=valid_force_hist,
+        )
+        if nonfinite_reason is not None:
+            raise FloatingPointError(nonfinite_reason)
+        if _tree_has_nonfinite_numeric(model):
+            raise FloatingPointError("nonfinite_training_history: model_parameters")
+
         # -------------------------
         # Predict
         # -------------------------
@@ -616,6 +785,7 @@ def run_one_architecture(
             abs_tol=cfg.abs_tol,
             rel_tol=cfg.rel_tol,
             fail_on_nonconvergence=cfg.prediction_fail_on_nonconvergence,
+            early_stop=cfg.early_stop,
         )
         valid_pred = predict(
             model, base, aux,
@@ -626,12 +796,31 @@ def run_one_architecture(
             abs_tol=cfg.abs_tol,
             rel_tol=cfg.rel_tol,
             fail_on_nonconvergence=cfg.prediction_fail_on_nonconvergence,
+            early_stop=cfg.early_stop,
         )
+
+        train_force_pred = None
+        valid_force_pred = None
+        train_force_truth = None
+        valid_force_truth = None
+        if _dataset_has_force_for_loss(cfg, train_data):
+            train_force_pred = _predict_dataset_reaction_forces(model, base, aux, train_data, cfg)
+            train_force_truth = np.asarray(train_data.forces, dtype=float)
+        if _dataset_has_force_for_loss(cfg, valid_data):
+            valid_force_pred = _predict_dataset_reaction_forces(model, base, aux, valid_data, cfg)
+            valid_force_truth = np.asarray(valid_data.forces, dtype=float)
 
         # -------------------------
         # Save config / arrays
         # -------------------------
-        save_config_json(cfg, spec, exp_dir)
+        save_config_json(
+            cfg,
+            spec,
+            exp_dir,
+            properties=properties,
+            train_file=train_file,
+            valid_file=valid_file,
+        )
 
         if cfg.save_model:
             save_model_artifact(exp_dir, model)
@@ -658,6 +847,10 @@ def run_one_architecture(
                 train_force_hist=train_force_hist,
                 valid_displacement_hist=valid_displacement_hist,
                 valid_force_hist=valid_force_hist,
+                train_force_pred=train_force_pred,
+                valid_force_pred=valid_force_pred,
+                train_force_truth=train_force_truth,
+                valid_force_truth=valid_force_truth,
             )
 
         # -------------------------
@@ -721,6 +914,30 @@ def run_one_architecture(
                     show=False,
                 )
 
+            if cfg.plot_force_predictions and train_force_pred is not None and train_force_truth is not None:
+                plot_force_prediction_vs_truth(
+                    pred_force=train_force_pred,
+                    true_force=train_force_truth,
+                    lambdas=train_data.lambdas,
+                    valid=train_data.valid,
+                    split_name="train",
+                    title=title,
+                    save_path=os.path.join(exp_dir, "force_pred_vs_truth_train.png"),
+                    show=False,
+                )
+
+            if cfg.plot_force_predictions and valid_force_pred is not None and valid_force_truth is not None:
+                plot_force_prediction_vs_truth(
+                    pred_force=valid_force_pred,
+                    true_force=valid_force_truth,
+                    lambdas=valid_data.lambdas,
+                    valid=valid_data.valid,
+                    split_name="valid",
+                    title=title,
+                    save_path=os.path.join(exp_dir, "force_pred_vs_truth_valid.png"),
+                    show=False,
+                )
+
         result = {
             "spec": spec,
             "cfg": cfg,
@@ -732,6 +949,10 @@ def run_one_architecture(
             "train_force_hist": None if train_force_hist is None else np.asarray(train_force_hist, dtype=float),
             "valid_displacement_hist": None if valid_displacement_hist is None else np.asarray(valid_displacement_hist, dtype=float),
             "valid_force_hist": None if valid_force_hist is None else np.asarray(valid_force_hist, dtype=float),
+            "train_force_pred": None if train_force_pred is None else np.asarray(train_force_pred, dtype=float),
+            "valid_force_pred": None if valid_force_pred is None else np.asarray(valid_force_pred, dtype=float),
+            "train_force_truth": None if train_force_truth is None else np.asarray(train_force_truth, dtype=float),
+            "valid_force_truth": None if valid_force_truth is None else np.asarray(valid_force_truth, dtype=float),
             "train_pred": np.asarray(train_pred, dtype=float),
             "valid_pred": np.asarray(valid_pred, dtype=float),
             "train_truth": np.asarray(train_data.qs),
@@ -754,7 +975,14 @@ def run_one_architecture(
         failure_reason = _classify_exception_message(repr(e))
 
         # still save minimal config + failure record
-        save_config_json(cfg, spec, exp_dir)
+        save_config_json(
+            cfg,
+            spec,
+            exp_dir,
+            properties=properties,
+            train_file=train_file,
+            valid_file=valid_file,
+        )
         failure_payload = {
             "arch_name": spec.name,
             "model_cls": spec.model_cls.__name__,
@@ -953,43 +1181,3 @@ def run_flag_grid(
                     )
 
     return all_results
-
-
-# =========================================================
-# 10) Optional summary plots across many models
-# =========================================================
-def plot_summary_final_losses(results: dict, save_path: Optional[str] = None, show: bool = False):
-    names = list(results.keys())
-    train_last = []
-    valid_last = []
-
-    for k in names:
-        r = results[k]
-        train_hist = np.asarray(r["train_hist"], dtype=float)
-        valid_hist = np.asarray(r["valid_hist"], dtype=float)
-        train_last.append(train_hist[-1])
-        valid_last.append(valid_hist[-1])
-
-    x = np.arange(len(names))
-    width = 0.38
-
-    fig, ax = plt.subplots(figsize=(max(10, 0.7 * len(names)), 5.5))
-    ax.bar(x - width / 2, train_last, width=width, label="Train")
-    ax.bar(x + width / 2, valid_last, width=width, label="Valid")
-
-    ax.set_yscale("log")
-    ax.set_ylabel("Final loss")
-    ax.set_title("Final train/valid loss by architecture")
-    ax.set_xticks(x)
-    ax.set_xticklabels(names, rotation=45, ha="right")
-    ax.legend()
-    ax.grid(True, axis="y", alpha=0.25)
-    fig.tight_layout()
-
-    if save_path is not None:
-        fig.savefig(save_path, dpi=300, bbox_inches="tight")
-
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)

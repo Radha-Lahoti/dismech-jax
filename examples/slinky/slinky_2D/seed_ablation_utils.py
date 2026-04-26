@@ -14,11 +14,62 @@ from run_architectures import (
 )
 
 
+def run_seed_hessian_diagnostics(output_dir: str, **diagnostic_kwargs):
+    """
+    Run post-training Hessian diagnostics for a saved seed ablation directory.
+
+    This is a thin convenience wrapper around
+    compute_architecture_hessian_diagnostics.py so seed sweeps keep Hessian
+    work separate from training, matching run_architectures.py.
+    """
+    from types import SimpleNamespace
+
+    from compute_architecture_hessian_diagnostics import (
+        _find_experiment_dirs,
+        compute_for_experiment,
+        write_hessian_summary_csv,
+    )
+
+    defaults = dict(
+        use_predicted=True,
+        splits=("train", "valid"),
+        max_trajectories=1,
+        all_trajectories=False,
+        stride=10,
+        train_file=None,
+        valid_file=None,
+        properties_class=None,
+        force_key=None,
+        fail_on_nonconvergence=False,
+        summary_csv="hessian_diagnostics_table.csv",
+    )
+    defaults.update(diagnostic_kwargs)
+    args = SimpleNamespace(**defaults)
+
+    exp_dirs = _find_experiment_dirs(output_dir)
+    n_ok = 0
+    for exp_dir in exp_dirs:
+        try:
+            n_ok += int(compute_for_experiment(exp_dir, args))
+        except Exception as exc:
+            print(f"[failed] {exp_dir}: {exc!r}")
+
+    if args.summary_csv:
+        write_hessian_summary_csv(output_dir, exp_dirs=exp_dirs, csv_name=args.summary_csv)
+
+    print(f"Finished Hessian diagnostics for {n_ok}/{len(exp_dirs)} seed runs.")
+    return n_ok
+
+
 # =========================================================
 # Helpers
 # =========================================================
 def _is_successful_result(r: dict) -> bool:
     return bool(r.get("success", True))
+
+
+def _is_nonfinite_training_failure(r: dict) -> bool:
+    return "nonfinite_training_history" in str(r.get("failure_reason", "")).lower()
 
 
 def _successful_results(seed_results: list[dict]) -> list[dict]:
@@ -230,6 +281,13 @@ def run_seed_ablation(
                 cfg=cfg,
             )
             arch_results.append(result)
+
+            if _is_nonfinite_training_failure(result):
+                print(
+                    f"[FAILED] {arch_name}: nonfinite training history for seed {seed}. "
+                    "Skipping remaining seeds for this architecture."
+                )
+                break
 
         all_results[arch_name] = arch_results
 

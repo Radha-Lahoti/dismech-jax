@@ -242,6 +242,112 @@ def plot_prediction_vs_truth_separate_components(
         plt.close(fig)
 
 
+def _force_component_labels(n_components: int, component_labels=None):
+    if component_labels is None:
+        defaults = ("Fx", "Fy", "Fz")
+        if n_components <= len(defaults):
+            return defaults[:n_components]
+        return tuple(f"F{i}" for i in range(n_components))
+    return tuple(component_labels[:n_components])
+
+
+def plot_force_prediction_vs_truth(
+    pred_force,
+    true_force,
+    lambdas,
+    valid,
+    split_name: str,
+    title: str,
+    save_path: Optional[str] = None,
+    show: bool = False,
+    component_labels=None,
+):
+    """
+    Overlay predicted and measured reaction-force trajectories.
+
+    Accepted force shapes are (n_traj, T) for scalar force and
+    (n_traj, T, n_components) for vector force.
+    """
+    pred_force = _to_numpy(pred_force)
+    true_force = _to_numpy(true_force)
+    lambdas = _to_numpy(lambdas)
+    valid = _to_numpy(valid).astype(bool)
+
+    if pred_force.ndim == 2:
+        pred_plot = pred_force[..., None]
+    elif pred_force.ndim == 3:
+        pred_plot = pred_force
+    else:
+        raise ValueError(
+            f"Expected pred_force shape (n_traj, T) or (n_traj, T, k), got {pred_force.shape}"
+        )
+
+    if true_force.ndim == 2:
+        true_plot = true_force[..., None]
+    elif true_force.ndim == 3:
+        true_plot = true_force
+    else:
+        raise ValueError(
+            f"Expected true_force shape (n_traj, T) or (n_traj, T, k), got {true_force.shape}"
+        )
+
+    n_components = min(pred_plot.shape[-1], true_plot.shape[-1])
+    pred_plot = pred_plot[..., :n_components]
+    true_plot = true_plot[..., :n_components]
+    labels = _force_component_labels(n_components, component_labels=component_labels)
+
+    n_traj = pred_plot.shape[0]
+    colors = cm.viridis(np.linspace(0, 1, max(n_traj, 1)))
+
+    fig, axes = plt.subplots(
+        n_components,
+        1,
+        figsize=(8.5, max(3.4, 2.7 * n_components)),
+        squeeze=False,
+        sharex=True,
+    )
+    axes = axes[:, 0]
+
+    for traj_idx in range(n_traj):
+        lam = lambdas if lambdas.ndim == 1 else lambdas[traj_idx]
+        mask = valid[traj_idx]
+        color = colors[traj_idx]
+
+        for comp_idx, ax in enumerate(axes):
+            ax.plot(
+                lam[mask],
+                pred_plot[traj_idx, mask, comp_idx],
+                color=color,
+                linestyle="-",
+                linewidth=1.8,
+            )
+            ax.plot(
+                lam[mask],
+                true_plot[traj_idx, mask, comp_idx],
+                color=color,
+                linestyle="--",
+                linewidth=1.6,
+                alpha=0.85,
+            )
+            ax.set_ylabel(labels[comp_idx])
+            ax.grid(True, alpha=0.25)
+
+    pred_line = mlines.Line2D([], [], color="black", linestyle="-", label="Prediction")
+    truth_line = mlines.Line2D([], [], color="black", linestyle="--", label="Truth")
+    axes[0].legend(handles=[pred_line, truth_line], loc="best")
+    axes[-1].set_xlabel("lambda")
+    fig.suptitle(f"{title} | force | {split_name}", y=1.01)
+    fig.tight_layout()
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
 def _load_scalar(data, key: str):
     value = np.asarray(data[key])
     if value.shape == ():
@@ -309,6 +415,31 @@ def plot_saved_results(
             show=show,
         )
 
+    if "train_force_pred" in data.files and "train_force_truth" in data.files:
+        plot_force_prediction_vs_truth(
+            pred_force=data["train_force_pred"],
+            true_force=data["train_force_truth"],
+            lambdas=data["train_lambdas"],
+            valid=data["train_valid_mask"],
+            split_name="train",
+            title=title,
+            save_path=maybe_path("force_pred_vs_truth_train.png"),
+            show=show,
+        )
+
+    if "valid_force_pred" in data.files and "valid_force_truth" in data.files:
+        plot_force_prediction_vs_truth(
+            pred_force=data["valid_force_pred"],
+            true_force=data["valid_force_truth"],
+            lambdas=data["valid_lambdas"],
+            valid=data["valid_valid_mask"],
+            split_name="valid",
+            title=title,
+            save_path=maybe_path("force_pred_vs_truth_valid.png"),
+            show=show,
+        )
+
+    if make_component_plots:
         plot_prediction_vs_truth_separate_components(
             pred=data["valid_pred"],
             truth=data["valid_truth"],
@@ -317,6 +448,43 @@ def plot_saved_results(
             save_path=maybe_path("pred_vs_truth_valid_xz.png"),
             show=show,
         )
+
+
+def plot_summary_final_losses(results: dict, save_path: Optional[str] = None, show: bool = False):
+    names = list(results.keys())
+    train_last = []
+    valid_last = []
+
+    for k in names:
+        r = results[k]
+        train_hist = np.asarray(r["train_hist"], dtype=float)
+        valid_hist = np.asarray(r["valid_hist"], dtype=float)
+        train_last.append(train_hist[-1])
+        valid_last.append(valid_hist[-1])
+
+    x = np.arange(len(names))
+    width = 0.38
+
+    fig, ax = plt.subplots(figsize=(max(10, 0.7 * len(names)), 5.5))
+    ax.bar(x - width / 2, train_last, width=width, label="Train")
+    ax.bar(x + width / 2, valid_last, width=width, label="Valid")
+
+    ax.set_yscale("log")
+    ax.set_ylabel("Final loss")
+    ax.set_title("Final train/valid loss by architecture")
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=45, ha="right")
+    ax.legend()
+    ax.grid(True, axis="y", alpha=0.25)
+    fig.tight_layout()
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
 
 
 def _load_results_file(results_path: str) -> dict:
