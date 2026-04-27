@@ -57,7 +57,7 @@ DEFAULT_ARCHITECTURES = (
 )
 DEFAULT_HESSIAN_REG_STRENGTHS = (0.0, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4)
 DEFAULT_EVAL_MAX_DLAMBDAS = (1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2, 1e-1)
-DEFAULT_SEEDS = (0, 1, 2, 3, 4)
+DEFAULT_SEEDS = (0,)
 
 
 def _parse_csv_floats(value: str) -> tuple[float, ...]:
@@ -132,7 +132,8 @@ def evaluate_stable_steps(
     records = []
     largest_stable = None
 
-    for max_dlambda in eval_max_dlambda_values:
+    sorted_values = sorted({float(v) for v in eval_max_dlambda_values}, reverse=True)
+    for max_dlambda in sorted_values:
         started = time.time()
         try:
             pred = predict(
@@ -171,6 +172,9 @@ def evaluate_stable_steps(
                 "seconds": round(time.time() - started, 3),
             }
         )
+
+        if success:
+            break
 
     return largest_stable, records
 
@@ -338,10 +342,23 @@ def run_experiment(args) -> list[dict]:
     csv_path = os.path.join(args.output_dir, "summary.csv")
     records = []
 
+    sorted_hregs = sorted(args.hessian_reg_strengths)
+    eval_max_value = (
+        max(args.eval_max_dlambda_values) if args.eval_max_dlambda_values else None
+    )
+
     for arch_name in args.architectures:
         spec = registry[arch_name]
+        arch_saturated = False
         for seed in args.seeds:
-            for hreg in args.hessian_reg_strengths:
+            if arch_saturated:
+                print(
+                    f"[skip] arch={arch_name} already saturated eval grid; "
+                    f"skipping seed={seed}.",
+                    flush=True,
+                )
+                break
+            for hreg in sorted_hregs:
                 cfg = make_cfg(args, seed=seed, hessian_reg_strength=hreg)
                 started = time.time()
                 print(
@@ -390,7 +407,7 @@ def run_experiment(args) -> list[dict]:
                             properties,
                             valid_data,
                             args.eval_max_dlambda_values,
-                            iters=args.iters,
+                            iters=args.eval_iters,
                             ls_steps=args.ls_steps,
                             abs_tol=args.abs_tol,
                             rel_tol=args.rel_tol,
@@ -436,6 +453,20 @@ def run_experiment(args) -> list[dict]:
                     f"train_success={record['train_success']} largest_eval={largest}",
                     flush=True,
                 )
+
+                if (
+                    eval_max_value is not None
+                    and largest is not None
+                    and float(largest) >= float(eval_max_value)
+                ):
+                    arch_saturated = True
+                    print(
+                        f"[skip] arch={arch_name} reached largest eval max_dlambda="
+                        f"{eval_max_value:g} at hreg={hreg:g} (seed={seed}); "
+                        f"skipping higher hregs and remaining seeds for this arch.",
+                        flush=True,
+                    )
+                    break
 
     with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
         json.dump(_jsonable(records), f, indent=2)
@@ -497,11 +528,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Structured Brazier mode; leave unset for the model default.",
     )
 
-    parser.add_argument("--n-epochs", type=int, default=500)
+    parser.add_argument("--n-epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--valid-every", type=int, default=1)
-    parser.add_argument("--iters", type=int, default=15)
+    parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument(
+        "--eval-iters",
+        type=int,
+        default=8,
+        help="Newton iterations during the post-training max_dlambda eval sweep (separate from training iters).",
+    )
     parser.add_argument("--ls-steps", type=int, default=10)
     parser.add_argument("--abs-tol", type=float, default=1e-4)
     parser.add_argument("--rel-tol", type=float, default=1e-4)
