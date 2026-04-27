@@ -116,6 +116,17 @@ def _is_finite_tree(tree) -> bool:
     return True
 
 
+def _inferred_eval_record(max_dlambda: float) -> dict:
+    return {
+        "max_dlambda": float(max_dlambda),
+        "success": True,
+        "valid_displacement_mse": float("nan"),
+        "failure_reason": "",
+        "seconds": 0.0,
+        "inferred_by_monotonicity": True,
+    }
+
+
 def evaluate_stable_steps(
     model,
     properties,
@@ -133,7 +144,7 @@ def evaluate_stable_steps(
     largest_stable = None
 
     sorted_values = sorted({float(v) for v in eval_max_dlambda_values}, reverse=True)
-    for max_dlambda in sorted_values:
+    for idx, max_dlambda in enumerate(sorted_values):
         started = time.time()
         try:
             pred = predict(
@@ -170,13 +181,46 @@ def evaluate_stable_steps(
                 "valid_displacement_mse": float(mse),
                 "failure_reason": failure_reason,
                 "seconds": round(time.time() - started, 3),
+                "inferred_by_monotonicity": False,
             }
         )
 
         if success:
+            for lower in sorted_values[idx + 1 :]:
+                records.append(_inferred_eval_record(lower))
             break
 
     return largest_stable, records
+
+
+def _make_inferred_record(
+    *,
+    arch_name: str,
+    seed: int,
+    hreg: float,
+    train_max_dlambda: float,
+    eval_max_value: float,
+    eval_grid,
+) -> dict:
+    sorted_grid = sorted({float(v) for v in eval_grid}, reverse=True)
+    return {
+        "arch_name": str(arch_name),
+        "seed": int(seed),
+        "hessian_reg_strength": float(hreg),
+        "train_max_dlambda": float(train_max_dlambda),
+        "train_success": True,
+        "failure_reason": "",
+        "exp_dir": "",
+        "exp_name": "",
+        "config": {},
+        "seconds_train_plus_eval": 0.0,
+        "largest_stable_eval_max_dlambda": float(eval_max_value),
+        "eval_by_max_dlambda": [_inferred_eval_record(v) for v in sorted_grid],
+        "hessian_summary": {},
+        "inferred_by_monotonicity": True,
+        "final_train_loss": float("nan"),
+        "final_valid_loss": float("nan"),
+    }
 
 
 def compute_hessian_summary(
@@ -225,6 +269,7 @@ def write_summary_csv(records: list[dict], csv_path: str) -> None:
         "seed",
         "hessian_reg_strength",
         "train_success",
+        "inferred_by_monotonicity",
         "failure_reason",
         "train_max_dlambda",
         "largest_stable_eval_max_dlambda",
@@ -251,13 +296,16 @@ def write_summary_csv(records: list[dict], csv_path: str) -> None:
             eval_successes = [
                 r["valid_displacement_mse"]
                 for r in record.get("eval_by_max_dlambda", [])
-                if r.get("success") and np.isfinite(r.get("valid_displacement_mse", np.nan))
+                if r.get("success")
+                and not r.get("inferred_by_monotonicity", False)
+                and np.isfinite(r.get("valid_displacement_mse", np.nan))
             ]
             row = {
                 "arch_name": record.get("arch_name", ""),
                 "seed": record.get("seed", ""),
                 "hessian_reg_strength": record.get("hessian_reg_strength", ""),
                 "train_success": record.get("train_success", ""),
+                "inferred_by_monotonicity": record.get("inferred_by_monotonicity", False),
                 "failure_reason": record.get("failure_reason", ""),
                 "train_max_dlambda": record.get("train_max_dlambda", ""),
                 "largest_stable_eval_max_dlambda": record.get(
@@ -351,14 +399,26 @@ def run_experiment(args) -> list[dict]:
         spec = registry[arch_name]
         arch_saturated = False
         for seed in args.seeds:
-            if arch_saturated:
-                print(
-                    f"[skip] arch={arch_name} already saturated eval grid; "
-                    f"skipping seed={seed}.",
-                    flush=True,
-                )
-                break
             for hreg in sorted_hregs:
+                if arch_saturated:
+                    inf_rec = _make_inferred_record(
+                        arch_name=arch_name,
+                        seed=seed,
+                        hreg=hreg,
+                        train_max_dlambda=args.train_max_dlambda,
+                        eval_max_value=eval_max_value,
+                        eval_grid=args.eval_max_dlambda_values,
+                    )
+                    records.append(inf_rec)
+                    append_jsonl(jsonl_path, inf_rec)
+                    write_summary_csv(records, csv_path)
+                    print(
+                        f"[inferred] arch={arch_name} seed={seed} hreg={hreg:g} "
+                        f"largest_eval={eval_max_value:g} (by monotonicity)",
+                        flush=True,
+                    )
+                    continue
+
                 cfg = make_cfg(args, seed=seed, hessian_reg_strength=hreg)
                 started = time.time()
                 print(
@@ -389,6 +449,7 @@ def run_experiment(args) -> list[dict]:
                     "largest_stable_eval_max_dlambda": None,
                     "eval_by_max_dlambda": [],
                     "hessian_summary": {},
+                    "inferred_by_monotonicity": False,
                 }
 
                 if result["success"] and result["model"] is not None:
@@ -461,12 +522,11 @@ def run_experiment(args) -> list[dict]:
                 ):
                     arch_saturated = True
                     print(
-                        f"[skip] arch={arch_name} reached largest eval max_dlambda="
+                        f"[saturate] arch={arch_name} reached largest eval max_dlambda="
                         f"{eval_max_value:g} at hreg={hreg:g} (seed={seed}); "
-                        f"skipping higher hregs and remaining seeds for this arch.",
+                        f"remaining hregs and seeds will be marked inferred.",
                         flush=True,
                     )
-                    break
 
     with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
         json.dump(_jsonable(records), f, indent=2)
