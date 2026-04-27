@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 from run_architectures import (
     build_architecture_registry,
     run_one_architecture,
+    subset_brazier_stiffness_only,
+    subset_tape_tube_candidates,
 )
 
 

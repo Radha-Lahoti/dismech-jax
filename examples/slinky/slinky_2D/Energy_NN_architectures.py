@@ -1,3 +1,5 @@
+import warnings
+
 import jax
 import jax.numpy as jnp
 import equinox as eqx
@@ -158,6 +160,7 @@ class ModelParams(eqx.Module):
     only_bending_NN: bool = eqx.field(static=True, default=False)
     zero_reference: bool = eqx.field(static=True, default=True)
     activation: str = eqx.field(static=True, default="softplus")
+    mode: str | None = eqx.field(static=True, default=None)
 
 
 # ===================================================================================== #
@@ -982,7 +985,7 @@ class StructuredBrazierCholeskyEnergyNN(eqx.Module):
     residual_net: VectorNet
 
     mode: str = eqx.field(static=True)          # "anisotropic" or "isotropic"
-    which_case: str = eqx.field(static=True)    # "MLP", "ICNN", or "no_residual"
+    which_case: str = eqx.field(static=True)    # "baseline", "MLP", or "ICNN"
     corr_factor: float = eqx.field(static=True)
     activation: str = eqx.field(static=True)
     input_mode: str = eqx.field(static=True)
@@ -993,11 +996,20 @@ class StructuredBrazierCholeskyEnergyNN(eqx.Module):
         self,
         params: ModelParams,
         *,
-        mode: str = "anisotropic",
         kappa_c_init: float = 1.0,
         alpha_init: float = 10.0,
         rho_min_init: float = 0.05,
     ):
+        mode = params.mode
+        if mode is None:
+            warnings.warn(
+                "StructuredBrazierCholeskyEnergyNN received params.mode=None; "
+                "defaulting to isotropic mode.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            mode = "isotropic"
+
         if mode not in ("anisotropic", "isotropic"):
             raise ValueError("mode must be either 'anisotropic' or 'isotropic'.")
 
@@ -1122,7 +1134,7 @@ class StructuredBrazierCholeskyEnergyNN(eqx.Module):
         This lets the NN learn coupling terms and mild corrections while the
         dominant Brazier softening is imposed explicitly.
         """
-        if self.which_case == "no_residual":
+        if self.which_case == "baseline":
             return jnp.zeros((3, 3))
 
         x = _reduced_strain_nn_input(
@@ -1139,6 +1151,189 @@ class StructuredBrazierCholeskyEnergyNN(eqx.Module):
 
         L = _vec_to_lower_triangular_3(self.corr_factor * p)
         return L @ L.T
+
+    def get_K_matrix(self, del_strain: jax.Array) -> jax.Array:
+        return self.get_structured_K(del_strain) + self.get_residual_K(del_strain)
+
+    def __call__(self, del_strain: jax.Array) -> jax.Array:
+        K = self.get_K_matrix(del_strain)
+        return _reduced_strain_energy_from_K(K, del_strain)
+
+
+# ===================================================================================== #
+# 7) StructuredBrazierDiagonalEnergyNN
+#     Reduced 3-strain energy with diagonal baseline stiffness and explicit Brazier
+#     softening in kappa1
+#     del_strain = [eps0, eps1, kappa1]
+# ===================================================================================== #
+class StructuredBrazierDiagonalEnergyNN(eqx.Module):
+    """
+    Energy model for strain vector
+
+        del_strain = [eps0, eps1, kappa1]
+
+    Uses a diagonal baseline stiffness:
+
+        E0 = 0.5 * k_s * (eps0^2 + eps1^2) + 0.5 * k_b * kappa1^2
+
+    The bending stiffness k_b softens explicitly after a learned critical
+    curvature. An optional diagonal PSD residual can add learned corrections.
+    """
+
+    # Baseline diagonal entries: shared stretch stiffness and bending stiffness
+    K0_raw: jax.Array          # shape (2,)
+
+    # Minimum retained stiffness ratio for kappa1 mode
+    rho_min_raw: jax.Array     # scalar
+
+    # Critical curvature parameters
+    kappa_c_raw: jax.Array     # shape (2,) anisotropic, shape (1,) isotropic
+
+    # Exponential decay rate parameters
+    alpha_raw: jax.Array       # shape (2,) anisotropic, shape (1,) isotropic
+
+    # Optional small diagonal PSD residual correction
+    residual_net: VectorNet
+
+    mode: str = eqx.field(static=True)          # "anisotropic" or "isotropic"
+    which_case: str = eqx.field(static=True)    # "baseline", "MLP", or "ICNN"
+    corr_factor: float = eqx.field(static=True)
+    activation: str = eqx.field(static=True)
+    input_mode: str = eqx.field(static=True)
+    only_stretching_NN: bool = eqx.field(static=True)
+    only_bending_NN: bool = eqx.field(static=True)
+
+    def __init__(
+        self,
+        params: ModelParams,
+        *,
+        kappa_c_init: float = 1.0,
+        alpha_init: float = 10.0,
+        rho_min_init: float = 0.05,
+    ):
+        mode = params.mode
+        if mode is None:
+            warnings.warn(
+                "StructuredBrazierDiagonalEnergyNN received params.mode=None; "
+                "defaulting to isotropic mode.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            mode = "isotropic"
+
+        if mode not in ("anisotropic", "isotropic"):
+            raise ValueError("mode must be either 'anisotropic' or 'isotropic'.")
+
+        self.mode = mode
+        self.which_case = params.which_case
+        self.corr_factor = params.corr_factor
+        self.activation = params.activation
+        self.input_mode = params.input_mode
+        self.only_stretching_NN = params.only_stretching_NN
+        self.only_bending_NN = params.only_bending_NN
+
+        der_K = jnp.ravel(params.der_K)
+        if der_K.shape != (2,):
+            raise ValueError(
+                "StructuredBrazierDiagonalEnergyNN expects params.der_K "
+                f"to have shape (2,), got {der_K.shape}."
+            )
+
+        self.K0_raw = inv_softplus(jnp.maximum(der_K, 1e-8))
+        self.rho_min_raw = inv_softplus(jnp.array(rho_min_init))
+
+        if mode == "anisotropic":
+            self.kappa_c_raw = inv_softplus(
+                jnp.array([kappa_c_init, kappa_c_init])
+            )
+            self.alpha_raw = inv_softplus(
+                jnp.array([alpha_init, alpha_init])
+            )
+        else:
+            self.kappa_c_raw = inv_softplus(jnp.array([kappa_c_init]))
+            self.alpha_raw = inv_softplus(jnp.array([alpha_init]))
+
+        self.residual_net = VectorNet(
+            params.which_case if params.which_case in ("MLP", "ICNN") else "MLP",
+            in_features=_reduced_strain_nn_in_features(
+                params.input_mode, params.only_stretching_NN, params.only_bending_NN
+            ),
+            hidden=params.hidden,
+            out_features=_stiffness_out_features(
+                2, params.only_stretching_NN, params.only_bending_NN
+            ),
+            key=params.key,
+            positive_output=False,
+            activation=params.activation,
+        )
+
+    def get_K0(self) -> jax.Array:
+        return jax.nn.softplus(self.K0_raw)
+
+    def get_brazier_params(self):
+        rho_min = jax.nn.softplus(self.rho_min_raw)
+        rho_min = jnp.minimum(rho_min, 0.999)
+
+        if self.mode == "anisotropic":
+            kappa_c_pos = jax.nn.softplus(self.kappa_c_raw[0])
+            kappa_c_neg = jax.nn.softplus(self.kappa_c_raw[1])
+            alpha_pos = jax.nn.softplus(self.alpha_raw[0])
+            alpha_neg = jax.nn.softplus(self.alpha_raw[1])
+        else:
+            kappa_c = jax.nn.softplus(self.kappa_c_raw[0])
+            alpha = jax.nn.softplus(self.alpha_raw[0])
+
+            kappa_c_pos = kappa_c
+            kappa_c_neg = kappa_c
+            alpha_pos = alpha
+            alpha_neg = alpha
+
+        return rho_min, kappa_c_pos, kappa_c_neg, alpha_pos, alpha_neg
+
+    def brazier_softening_factor(self, kappa1: jax.Array) -> jax.Array:
+        rho_min, kappa_c_pos, kappa_c_neg, alpha_pos, alpha_neg = (
+            self.get_brazier_params()
+        )
+
+        soft_pos = jax.nn.softplus(kappa1 - kappa_c_pos)
+        soft_neg = jax.nn.softplus(-kappa1 - kappa_c_neg)
+
+        decay = jnp.exp(
+            -alpha_pos * soft_pos**2
+            -alpha_neg * soft_neg**2
+        )
+
+        return rho_min + (1.0 - rho_min) * decay
+
+    def get_structured_K(self, del_strain: jax.Array) -> jax.Array:
+        """
+        Diagonal PSD stiffness matrix with explicit bending softening.
+        """
+        del_strain = _reduced_strain_vector(del_strain)
+
+        k_s, k_b = self.get_K0()
+        s = self.brazier_softening_factor(del_strain[2])
+
+        return jnp.diag(jnp.array([k_s, k_s, k_b * s]))
+
+    def get_residual_K(self, del_strain: jax.Array) -> jax.Array:
+        """
+        Small diagonal PSD residual correction.
+        """
+        if self.which_case == "baseline":
+            return jnp.zeros((3, 3))
+
+        x = _reduced_strain_nn_input(
+            del_strain, self.input_mode, self.only_stretching_NN, self.only_bending_NN
+        )
+        p = self.residual_net(x)
+        corr = jax.nn.softplus(self.corr_factor * p)
+
+        if self.only_stretching_NN:
+            return jnp.diag(jnp.array([corr[0], corr[0], 0.0]))
+        if self.only_bending_NN:
+            return jnp.diag(jnp.array([0.0, 0.0, corr[0]]))
+        return jnp.diag(jnp.array([corr[0], corr[0], corr[1]]))
 
     def get_K_matrix(self, del_strain: jax.Array) -> jax.Array:
         return self.get_structured_K(del_strain) + self.get_residual_K(del_strain)

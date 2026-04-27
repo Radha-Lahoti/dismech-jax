@@ -417,7 +417,12 @@ def make_energy_snapshot_fn(
 
         _ = auxs  # retained for debugging if you later want to save/use it
 
-        tag = "initial" if epoch == -1 else None
+        if epoch == -1:
+            tag = "initial"
+        elif epoch == "final":
+            tag = "final"
+        else:
+            tag = None
         save_energy_landscape_snapshot_from_solution(
             model=model,
             del_strains=del_strains,

@@ -749,6 +749,14 @@ def train_model(
     best_epoch = -1
     epochs_without_improvement = 0
     snapshot_epoch_set = None if snapshot_epochs is None else set(snapshot_epochs)
+    final_snapshot_requested = (
+        snapshot_fn is not None
+        and snapshot_epoch_set is not None
+        and (n_epochs - 1) in snapshot_epoch_set
+    )
+    if final_snapshot_requested:
+        snapshot_epoch_set = set(snapshot_epoch_set)
+        snapshot_epoch_set.remove(n_epochs - 1)
 
     if snapshot_fn is not None and snapshot_before_training:
         snapshot_fn(
@@ -873,6 +881,18 @@ def train_model(
 
     if restore_best_model and best_epoch >= 0:
         model = best_model
+
+    if final_snapshot_requested:
+        snapshot_fn(
+            model=model,
+            epoch="final",
+            base=base,
+            aux=aux,
+            train=train,
+            valid=valid,
+            train_loss=train_hist[-1] if train_hist else jnp.nan,
+            val_loss=best_val_loss if best_epoch >= 0 else last_val_loss,
+        )
 
     if return_loss_components:
         return (

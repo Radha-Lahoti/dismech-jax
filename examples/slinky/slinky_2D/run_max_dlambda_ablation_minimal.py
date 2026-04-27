@@ -21,8 +21,10 @@ from run_architectures import (
     experiment_name as _architecture_experiment_name,
     make_model_params as _make_architecture_params,
     subset_all,
+    subset_brazier_stiffness_only,
     subset_energy_only,
     subset_main_paper_candidates,
+    subset_tape_tube_candidates,
 )
 
 
@@ -38,9 +40,11 @@ class MaxDlambdaAblationConfig:
     only_bending_NN: bool = False
     zero_reference: bool = True
     activation: str = "softplus"
+    mode: Optional[str] = None
 
     n_epochs: int = 100
     lr: float = 1e-2
+    weight_decay: float = 0.0
     seed_list: tuple[int, ...] = (0,)
     valid_every: int = 1
 
@@ -265,6 +269,7 @@ def _make_record(
         "early_stop": bool(cfg.early_stop),
         "n_epochs": int(cfg.n_epochs),
         "lr": float(cfg.lr),
+        "weight_decay": float(cfg.weight_decay),
         "train_fail_on_nonconvergence": bool(cfg.train_fail_on_nonconvergence),
         "validation_loss_fail_on_nonconvergence": False,
         "prediction_fail_on_nonconvergence": bool(cfg.prediction_fail_on_nonconvergence),
@@ -356,6 +361,8 @@ def _save_npz(
         only_stretching_NN=int(cfg.only_stretching_NN),
         only_bending_NN=int(cfg.only_bending_NN),
         zero_reference=int(cfg.zero_reference),
+        lr=float(cfg.lr),
+        weight_decay=float(cfg.weight_decay),
         der_K_diag=np.asarray(cfg.der_K_diag, dtype=float),
         der_K_chol=np.asarray(cfg.der_K_chol, dtype=float),
         iters=int(cfg.iters),
@@ -530,6 +537,7 @@ def run_one_max_dlambda_case(
             force_loss_strength=cfg.force_loss_strength,
             force_components=cfg.force_components,
             force_sign=cfg.force_sign,
+            weight_decay=cfg.weight_decay,
             early_stopping_patience=(
                 cfg.early_stopping_patience if cfg.early_stopping else None
             ),

@@ -1,6 +1,6 @@
-import os
 import json
-from dataclasses import dataclass, replace, asdict, field
+import os
+from dataclasses import dataclass, replace, asdict, field, fields
 from typing import Optional
 
 import numpy as np
@@ -26,6 +26,8 @@ from Energy_NN_architectures import (
     DiagonalPlusStiffnessNN,
     CholeskyPlusStiffnessNN,
     CholeskyPlusStiffnessSignedNN,
+    StructuredBrazierCholeskyEnergyNN,
+    StructuredBrazierDiagonalEnergyNN,
 )
 
 
@@ -84,6 +86,36 @@ def build_architecture_registry() -> dict[str, ArchSpec]:
             model_cls=CholeskyPlusEnergyNN,
             which_case="ICNN",
         ),
+        "brazier_diag_stiffness_baseline": ArchSpec(
+            name="brazier_diag_stiffness_baseline",
+            model_cls=StructuredBrazierDiagonalEnergyNN,
+            which_case="baseline",
+        ),
+        "brazier_diag_stiffness_mlp": ArchSpec(
+            name="brazier_diag_stiffness_mlp",
+            model_cls=StructuredBrazierDiagonalEnergyNN,
+            which_case="MLP",
+        ),
+        "brazier_diag_stiffness_icnn": ArchSpec(
+            name="brazier_diag_stiffness_icnn",
+            model_cls=StructuredBrazierDiagonalEnergyNN,
+            which_case="ICNN",
+        ),
+        "brazier_chol_stiffness_baseline": ArchSpec(
+            name="brazier_chol_stiffness_baseline",
+            model_cls=StructuredBrazierCholeskyEnergyNN,
+            which_case="baseline",
+        ),
+        "brazier_chol_stiffness_mlp": ArchSpec(
+            name="brazier_chol_stiffness_mlp",
+            model_cls=StructuredBrazierCholeskyEnergyNN,
+            which_case="MLP",
+        ),
+        "brazier_chol_stiffness_icnn": ArchSpec(
+            name="brazier_chol_stiffness_icnn",
+            model_cls=StructuredBrazierCholeskyEnergyNN,
+            which_case="ICNN",
+        ),
 
         # -------------------------
         # Stiffness families
@@ -138,8 +170,10 @@ class SweepConfig:
     only_bending_NN: bool = False
     zero_reference: bool = True      # relevant for energy-correction families
     activation: str = "softplus"     # relevant for MLP nets
+    mode: Optional[str] = None        # relevant for structured Brazier families
     n_epochs: int = 100
     lr: float = 1e-2
+    weight_decay: float = 0.0
     seed: int = 0
 
     # solver / training-loop compatibility with the training utilities
@@ -218,7 +252,11 @@ class SweepConfig:
 # 3) Config / params helpers
 # =========================================================
 def is_diagonal_family(model_cls: type) -> bool:
-    return model_cls in (DiagonalPlusEnergyNN, DiagonalPlusStiffnessNN)
+    return model_cls in (
+        DiagonalPlusEnergyNN,
+        DiagonalPlusStiffnessNN,
+        StructuredBrazierDiagonalEnergyNN,
+    )
 
 
 def is_cholesky_family(model_cls: type) -> bool:
@@ -226,6 +264,7 @@ def is_cholesky_family(model_cls: type) -> bool:
         CholeskyPlusEnergyNN,
         CholeskyPlusStiffnessNN,
         CholeskyPlusStiffnessSignedNN,
+        StructuredBrazierCholeskyEnergyNN,
     )
 
 
@@ -260,6 +299,7 @@ def make_model_params(cfg: SweepConfig, spec: ArchSpec) -> ModelParams:
         only_bending_NN=cfg.only_bending_NN,
         zero_reference=cfg.zero_reference,
         activation=cfg.activation,
+        mode=cfg.mode,
     )
 
 
@@ -285,6 +325,8 @@ def experiment_name(spec: ArchSpec, cfg: SweepConfig) -> str:
             f"__hprobe_{cfg.hessian_reg_probes}"
             f"__hseed_{cfg.hessian_reg_seed}"
         )
+    if cfg.weight_decay != 0.0:
+        name += f"__wd_{cfg.weight_decay:g}"
     if cfg.force_loss_strength != 0.0:
         comps = "-".join(str(c) for c in cfg.force_components)
         name += (
@@ -292,6 +334,11 @@ def experiment_name(spec: ArchSpec, cfg: SweepConfig) -> str:
             f"__fcomp_{comps}"
             f"__fsign_{cfg.force_sign:g}"
         )
+    if cfg.mode is not None and spec.model_cls in (
+        StructuredBrazierCholeskyEnergyNN,
+        StructuredBrazierDiagonalEnergyNN,
+    ):
+        name += f"__mode_{cfg.mode}"
     return name
 
 
@@ -353,7 +400,7 @@ def _build_energy_snapshot_controls(cfg: SweepConfig, exp_dir: str):
 
     Default behavior:
       - initial landscape before training
-      - final landscape after last epoch
+      - final landscape for the model returned by training
 
     Optional extras:
       - any explicit epoch numbers in energy_snapshot_epochs
@@ -566,6 +613,8 @@ def save_results_npz(
         only_bending_NN=int(cfg.only_bending_NN),
         zero_reference=int(cfg.zero_reference),
         seed=cfg.seed,
+        lr=float(cfg.lr),
+        weight_decay=float(cfg.weight_decay),
         der_K_diag=np.asarray(cfg.der_K_diag, dtype=float),
         der_K_chol=np.asarray(cfg.der_K_chol, dtype=float),
         max_dlambda=float(cfg.max_dlambda),
@@ -629,6 +678,216 @@ def save_model_artifact(exp_dir: str, model):
 
 
 # =========================================================
+# 5) Post-training energy landscape generation
+# =========================================================
+def _sweep_config_from_payload(payload: dict) -> SweepConfig:
+    field_names = {f.name for f in fields(SweepConfig)}
+    kwargs = {key: value for key, value in payload.items() if key in field_names}
+
+    tuple_keys = {
+        "der_K_diag",
+        "der_K_chol",
+        "hidden",
+        "force_components",
+        "hessian_diagnostics_splits",
+        "seed_list",
+        "energy_snapshot_epochs",
+    }
+    for key in tuple_keys:
+        if key in kwargs and kwargs[key] is not None:
+            kwargs[key] = tuple(kwargs[key])
+
+    spec_payload = kwargs.get("energy_landscape_spec")
+    if isinstance(spec_payload, dict):
+        spec_fields = {f.name for f in fields(EnergyLandscapeSpec)}
+        spec_kwargs = {
+            key: value for key, value in spec_payload.items() if key in spec_fields
+        }
+        kwargs["energy_landscape_spec"] = EnergyLandscapeSpec(**spec_kwargs)
+
+    return SweepConfig(**kwargs)
+
+
+def _properties_from_payload(payload: dict):
+    import properties as properties_module
+
+    prop_payload = payload.get("properties")
+    if prop_payload is None:
+        raise ValueError(
+            "No properties metadata found in config.json. Re-run the sweep with a "
+            "newer run_architectures.py or add properties metadata to the config."
+        )
+
+    class_name = prop_payload["class_name"]
+    prop_cls = getattr(properties_module, class_name)
+    valid_fields = {f.name for f in fields(prop_cls)}
+    kwargs = {
+        key: value
+        for key, value in prop_payload.items()
+        if key != "class_name" and key in valid_fields
+    }
+    return prop_cls(**kwargs)
+
+
+def _resolve_saved_data_path(payload: dict, key: str, exp_dir: str) -> str:
+    path = payload.get(key)
+    if path is None:
+        raise ValueError(f"No {key} stored in {os.path.join(exp_dir, 'config.json')}.")
+    if os.path.isabs(path):
+        return path
+
+    candidates = [
+        os.path.abspath(path),
+        os.path.abspath(os.path.join(exp_dir, path)),
+        os.path.abspath(os.path.join(os.path.dirname(exp_dir), path)),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return candidates[0]
+
+
+def _find_saved_experiment_dirs(output_dir: str) -> list[str]:
+    output_dir = os.path.abspath(output_dir)
+    if os.path.isfile(os.path.join(output_dir, "config.json")):
+        return [output_dir]
+
+    exp_dirs = []
+    for root, dirs, files in os.walk(output_dir):
+        if "config.json" in files:
+            exp_dirs.append(root)
+            dirs[:] = []
+    return sorted(exp_dirs)
+
+
+def generate_energy_landscapes_for_experiment(
+    exp_dir: str,
+    *,
+    include_initial: bool = False,
+    include_final: bool = True,
+    use_valid: Optional[bool] = None,
+    traj_idx: Optional[int] = None,
+    output_dir: Optional[str] = None,
+    dpi: Optional[int] = None,
+    n_grid: Optional[int] = None,
+) -> dict[str, str]:
+    """Recreate energy landscape plots from saved config/model/data artifacts."""
+    config_path = os.path.join(exp_dir, "config.json")
+    model_path = os.path.join(exp_dir, "model.eqx")
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(config_path)
+    if include_final and not os.path.isfile(model_path):
+        raise FileNotFoundError(model_path)
+
+    with open(config_path) as f:
+        payload = json.load(f)
+
+    cfg = _sweep_config_from_payload(payload)
+    registry = build_architecture_registry()
+    arch_name = payload.get("arch_name")
+    if arch_name not in registry:
+        raise ValueError(f"Unknown or missing arch_name in {config_path}: {arch_name}")
+    spec = registry[arch_name]
+
+    properties = _properties_from_payload(payload)
+    train_file = _resolve_saved_data_path(payload, "train_file", exp_dir)
+    valid_file = _resolve_saved_data_path(payload, "valid_file", exp_dir)
+
+    params = make_model_params(cfg, spec)
+    base, aux = get_slinky(properties)
+    train = Dataset.load(train_file, force_key=False)
+    valid = Dataset.load(valid_file, force_key=False)
+
+    spec_local = replace(cfg.energy_landscape_spec)
+    if traj_idx is not None:
+        spec_local.traj_idx = int(traj_idx)
+
+    save_dir = output_dir or os.path.join(exp_dir, cfg.energy_snapshot_dirname)
+    snapshot_fn = make_energy_snapshot_fn(
+        spec=spec_local,
+        save_dir=save_dir,
+        use_valid=cfg.energy_snapshot_use_valid if use_valid is None else bool(use_valid),
+        traj_idx=spec_local.traj_idx,
+        max_dlambda=cfg.max_dlambda,
+        iters=cfg.iters,
+        ls_steps=cfg.ls_steps,
+        dpi=cfg.energy_snapshot_dpi if dpi is None else int(dpi),
+        n_grid_snapshot=cfg.energy_snapshot_n_grid if n_grid is None else int(n_grid),
+    )
+
+    written = {}
+    if include_initial:
+        initial_model = spec.model_cls(params)
+        snapshot_fn(
+            model=initial_model,
+            epoch=-1,
+            base=base,
+            aux=aux,
+            train=train,
+            valid=valid,
+        )
+        written["initial"] = os.path.join(save_dir, "energy_landscape_initial.png")
+
+    if include_final:
+        model = eqx.tree_deserialise_leaves(model_path, spec.model_cls(params))
+        snapshot_fn(
+            model=model,
+            epoch="final",
+            base=base,
+            aux=aux,
+            train=train,
+            valid=valid,
+        )
+        written["final"] = os.path.join(save_dir, "energy_landscape_final.png")
+
+    return written
+
+
+def generate_energy_landscapes_for_sweep(
+    output_dir: str,
+    *,
+    architectures: Optional[list[str]] = None,
+    include_initial: bool = False,
+    include_final: bool = True,
+    use_valid: Optional[bool] = None,
+    traj_idx: Optional[int] = None,
+    dpi: Optional[int] = None,
+    n_grid: Optional[int] = None,
+    continue_on_failure: bool = True,
+) -> dict[str, dict[str, str]]:
+    """Generate post-training energy landscapes for all saved architecture runs."""
+    requested = None if architectures is None else set(architectures)
+    outputs = {}
+    for exp_dir in _find_saved_experiment_dirs(output_dir):
+        config_path = os.path.join(exp_dir, "config.json")
+        try:
+            with open(config_path) as f:
+                payload = json.load(f)
+            arch_name = payload.get("arch_name", os.path.basename(exp_dir))
+            if requested is not None and arch_name not in requested:
+                continue
+
+            outputs[arch_name] = generate_energy_landscapes_for_experiment(
+                exp_dir,
+                include_initial=include_initial,
+                include_final=include_final,
+                use_valid=use_valid,
+                traj_idx=traj_idx,
+                dpi=dpi,
+                n_grid=n_grid,
+            )
+            print(f"[ok] {arch_name}: {outputs[arch_name]}")
+        except Exception as exc:
+            if not continue_on_failure:
+                raise
+            arch_name = os.path.basename(exp_dir)
+            outputs[arch_name] = {"error": str(exc)}
+            print(f"[skip] {exp_dir}: {exc}")
+
+    return outputs
+
+
+# =========================================================
 # 6) Run one experiment
 # =========================================================
 def run_one_architecture(
@@ -653,6 +912,9 @@ def run_one_architecture(
         print(f"  corr_factor             : {cfg.corr_factor}")
         print(f"  zero_reference          : {cfg.zero_reference}")
         print(f"  seed                    : {cfg.seed}")
+        print(f"  n_epochs                : {cfg.n_epochs}")
+        print(f"  lr                      : {cfg.lr}")
+        print(f"  weight_decay            : {cfg.weight_decay}")
         print(f"  max_dlambda             : {cfg.max_dlambda}")
         print(f"  iters                   : {cfg.iters}")
         print(f"  ls_steps                : {cfg.ls_steps}")
@@ -732,6 +994,7 @@ def run_one_architecture(
             force_loss_strength=cfg.force_loss_strength,
             force_components=cfg.force_components,
             force_sign=cfg.force_sign,
+            weight_decay=cfg.weight_decay,
             early_stopping_patience=(
                 cfg.early_stopping_patience if cfg.early_stopping else None
             ),
@@ -1092,7 +1355,7 @@ def run_architecture_sweep(
 # 8) Convenience subsets
 # =========================================================
 def subset_all() -> list[str]:
-    return list(build_architecture_registry().keys())
+    return subset_energy_only() + subset_stiffness_only()
 
 
 def subset_energy_only() -> list[str]:
@@ -1106,6 +1369,21 @@ def subset_energy_only() -> list[str]:
         "chol_energy_mlp",
         "chol_energy_icnn",
     ]
+
+
+def subset_brazier_stiffness_only() -> list[str]:
+    return [
+        "brazier_diag_stiffness_baseline",
+        "brazier_diag_stiffness_mlp",
+        "brazier_diag_stiffness_icnn",
+        "brazier_chol_stiffness_baseline",
+        "brazier_chol_stiffness_mlp",
+        "brazier_chol_stiffness_icnn",
+    ]
+
+
+def subset_tape_tube_candidates() -> list[str]:
+    return subset_energy_only() + subset_brazier_stiffness_only()
 
 
 def subset_stiffness_only() -> list[str]:
