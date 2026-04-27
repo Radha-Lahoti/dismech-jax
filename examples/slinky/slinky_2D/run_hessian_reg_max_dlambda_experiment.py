@@ -397,10 +397,10 @@ def run_experiment(args) -> list[dict]:
 
     for arch_name in args.architectures:
         spec = registry[arch_name]
-        arch_saturated = False
         for seed in args.seeds:
+            seed_saturated = False
             for hreg in sorted_hregs:
-                if arch_saturated:
+                if seed_saturated:
                     inf_rec = _make_inferred_record(
                         arch_name=arch_name,
                         seed=seed,
@@ -520,11 +520,11 @@ def run_experiment(args) -> list[dict]:
                     and largest is not None
                     and float(largest) >= float(eval_max_value)
                 ):
-                    arch_saturated = True
+                    seed_saturated = True
                     print(
-                        f"[saturate] arch={arch_name} reached largest eval max_dlambda="
-                        f"{eval_max_value:g} at hreg={hreg:g} (seed={seed}); "
-                        f"remaining hregs and seeds will be marked inferred.",
+                        f"[saturate] arch={arch_name} seed={seed} reached largest "
+                        f"eval max_dlambda={eval_max_value:g} at hreg={hreg:g}; "
+                        f"remaining hregs for this seed will be marked inferred.",
                         flush=True,
                     )
 

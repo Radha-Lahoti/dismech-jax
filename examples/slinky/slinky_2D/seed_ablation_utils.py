@@ -481,43 +481,59 @@ def plot_seed_loss_envelope(
         print(f"[plot_seed_loss_envelope] No successful runs available for {which}. Skipping plot.")
         return
 
-    losses = []
+    loss_arrays = []
     seeds = []
 
     for r in good_results:
         if r.get(hist_key, None) is None:
             continue
-        losses.append(r[hist_key])
+        arr = np.asarray(r[hist_key], dtype=float).reshape(-1)
+        if arr.size == 0 or not np.any(np.isfinite(arr)):
+            continue
+        loss_arrays.append(arr)
         seeds.append(r["cfg"].seed)
 
-    if len(losses) == 0:
+    if len(loss_arrays) == 0:
         print(f"[plot_seed_loss_envelope] No {which} histories available. Skipping plot.")
         return
 
-    losses = np.asarray(losses, dtype=float)
+    max_len = max(arr.size for arr in loss_arrays)
+    losses = np.full((len(loss_arrays), max_len), np.nan, dtype=float)
+    for i, arr in enumerate(loss_arrays):
+        losses[i, : arr.size] = arr
+
     seeds = np.asarray(seeds, dtype=int)
 
-    q05 = np.percentile(losses, 5, axis=0)
-    q25 = np.percentile(losses, 25, axis=0)
-    q50 = np.percentile(losses, 50, axis=0)
-    q75 = np.percentile(losses, 75, axis=0)
-    q95 = np.percentile(losses, 95, axis=0)
+    valid_epochs = np.any(np.isfinite(losses), axis=0)
+    epoch_axis = np.arange(losses.shape[1])
+    envelope_losses = losses[:, valid_epochs]
 
-    final_losses = losses[:, -1]
+    q05 = np.nanpercentile(envelope_losses, 5, axis=0)
+    q25 = np.nanpercentile(envelope_losses, 25, axis=0)
+    q50 = np.nanpercentile(envelope_losses, 50, axis=0)
+    q75 = np.nanpercentile(envelope_losses, 75, axis=0)
+    q95 = np.nanpercentile(envelope_losses, 95, axis=0)
+
+    final_losses = np.asarray(
+        [arr[np.isfinite(arr)][-1] for arr in loss_arrays],
+        dtype=float,
+    )
     best_idx = int(np.argmin(final_losses))
     best_seed = int(seeds[best_idx])
 
     fig, ax = plt.subplots(figsize=(8.0, 5.4))
 
-    for i in range(losses.shape[0]):
-        ax.plot(losses[i], linewidth=1.0, alpha=0.18)
+    for arr in loss_arrays:
+        ax.plot(np.arange(arr.size), arr, linewidth=1.0, alpha=0.18)
 
-    ax.fill_between(np.arange(losses.shape[1]), q05, q95, alpha=0.18, label="5-95%")
-    ax.fill_between(np.arange(losses.shape[1]), q25, q75, alpha=0.28, label="25-75%")
+    envelope_axis = epoch_axis[valid_epochs]
+    ax.fill_between(envelope_axis, q05, q95, alpha=0.18, label="5-95%")
+    ax.fill_between(envelope_axis, q25, q75, alpha=0.28, label="25-75%")
 
-    ax.plot(q50, linestyle="--", linewidth=2.2, label="Median across seeds")
+    ax.plot(envelope_axis, q50, linestyle="--", linewidth=2.2, label="Median across seeds")
     ax.plot(
-        losses[best_idx],
+        np.arange(loss_arrays[best_idx].size),
+        loss_arrays[best_idx],
         linewidth=2.5,
         label=f"Best seed = {best_seed} (final {which} = {final_losses[best_idx]:.3e})",
     )
