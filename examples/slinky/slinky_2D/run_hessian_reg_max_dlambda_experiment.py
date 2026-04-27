@@ -364,6 +364,7 @@ def make_cfg(args, *, seed: int, hessian_reg_strength: float) -> SweepConfig:
         early_stopping=not args.no_early_stopping,
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
+        early_stopping_warmup_epochs=args.early_stopping_warmup_epochs,
         restore_best_model=not args.no_restore_best_model,
         save_force_predictions=False,
         plot_force_predictions=False,
@@ -621,6 +622,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-early-stopping", action="store_true")
     parser.add_argument("--early-stopping-patience", type=int, default=25)
     parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
+    parser.add_argument("--early-stopping-warmup-epochs", type=int, default=0)
     parser.add_argument("--no-restore-best-model", action="store_true")
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--quiet", action="store_true")

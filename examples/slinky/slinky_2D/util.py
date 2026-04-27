@@ -657,6 +657,7 @@ def train_model(
     weight_decay=0.0,
     early_stopping_patience=None,
     early_stopping_min_delta=0.0,
+    early_stopping_warmup_epochs=0,
     restore_best_model=True,
     return_loss_components=False,
 ):
@@ -815,14 +816,15 @@ def train_model(
                 force_sign=force_sign,
             )
 
-            improved = last_val_loss < (best_val_loss - early_stopping_min_delta)
-            if bool(improved):
-                best_model = model
-                best_val_loss = last_val_loss
-                best_epoch = i
-                epochs_without_improvement = 0
-            else:
-                epochs_without_improvement += valid_every
+            if i >= early_stopping_warmup_epochs:
+                improved = last_val_loss < (best_val_loss - early_stopping_min_delta)
+                if bool(improved):
+                    best_model = model
+                    best_val_loss = last_val_loss
+                    best_epoch = i
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += valid_every
 
         valid_hist.append(last_val_loss)
         valid_displacement_hist.append(last_val_displacement_loss)
@@ -870,6 +872,7 @@ def train_model(
         if (
             early_stopping_patience is not None
             and do_valid
+            and i >= early_stopping_warmup_epochs
             and epochs_without_improvement >= early_stopping_patience
         ):
             print(

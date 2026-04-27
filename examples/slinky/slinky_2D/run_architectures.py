@@ -207,6 +207,7 @@ class SweepConfig:
     early_stopping: bool = True
     early_stopping_patience: Optional[int] = 25
     early_stopping_min_delta: float = 0.0
+    early_stopping_warmup_epochs: int = 0
     restore_best_model: bool = True
 
     # Stored Hessian-path diagnostics for trained models. Prefer running these
@@ -926,6 +927,7 @@ def run_one_architecture(
         print(f"  prediction fail_on_nonconvergence     : {cfg.prediction_fail_on_nonconvergence}")
         print(f"  early_stopping          : {cfg.early_stopping}")
         print(f"  early_stopping_patience : {cfg.early_stopping_patience}")
+        print(f"  early_stopping_warmup   : {cfg.early_stopping_warmup_epochs}")
         print(f"  restore_best_model      : {cfg.restore_best_model}")
         print(f"  hessian_reg_strength    : {cfg.hessian_reg_strength}")
         print(f"  hessian_reg_probes      : {cfg.hessian_reg_probes}")
@@ -999,6 +1001,7 @@ def run_one_architecture(
                 cfg.early_stopping_patience if cfg.early_stopping else None
             ),
             early_stopping_min_delta=cfg.early_stopping_min_delta,
+            early_stopping_warmup_epochs=cfg.early_stopping_warmup_epochs,
             restore_best_model=cfg.restore_best_model,
             return_loss_components=cfg.return_loss_components,
         )
