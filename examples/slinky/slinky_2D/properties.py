@@ -49,7 +49,9 @@ class StripN9Properties(Properties):
 
 @dataclass
 class TubeN7Properties(Properties):
-    length: float = 0.5
+    # length: float = 0.5
+    start: jax.Array = field(default_factory=lambda: jax.numpy.array([0.0, 0.0, 0.0]))
+    end: jax.Array = field(default_factory=lambda: jax.numpy.array([0.46, 0.0, 0.03]))
     r0: float = 0.005
     density: float = 600.0
     E: float = 1e6
