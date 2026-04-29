@@ -897,6 +897,32 @@ def _vec_to_lower_triangular_3(p: jax.Array) -> jax.Array:
     return L
 
 
+def _vec_to_lower_triangular_2(p: jax.Array) -> jax.Array:
+    """Map 3-vector to 2x2 lower-triangular matrix."""
+    p = jnp.ravel(p)
+    if p.shape != (3,):
+        raise ValueError(f"Expected p shape (3,), got {p.shape}")
+
+    return jnp.array(
+        [
+            [jax.nn.softplus(p[0]) + 1e-6, 0.0],
+            [p[1], jax.nn.softplus(p[2]) + 1e-6],
+        ]
+    )
+
+
+def _structured_brazier_cholesky_out_features(
+    only_stretching_NN: bool,
+    only_bending_NN: bool,
+) -> int:
+    _validate_nn_feature_flags(only_stretching_NN, only_bending_NN)
+    if only_stretching_NN:
+        return 3  # lower-triangular 2x2 stretch block
+    if only_bending_NN:
+        return 1
+    return 6  # lower-triangular 3x3 residual
+
+
 def _reduced_strain_vector(
     del_strain: jax.Array,
 ) -> jax.Array:
@@ -1052,8 +1078,8 @@ class StructuredBrazierCholeskyEnergyNN(eqx.Module):
                 params.input_mode, params.only_stretching_NN, params.only_bending_NN
             ),
             hidden=params.hidden,
-            out_features=_stiffness_out_features(
-                6, params.only_stretching_NN, params.only_bending_NN
+            out_features=_structured_brazier_cholesky_out_features(
+                params.only_stretching_NN, params.only_bending_NN
             ),
             key=params.key,
             positive_output=False,
@@ -1144,7 +1170,8 @@ class StructuredBrazierCholeskyEnergyNN(eqx.Module):
 
         if self.only_stretching_NN:
             K = jnp.zeros((3, 3))
-            return K.at[0, 0].set(jax.nn.softplus(self.corr_factor * p[0]))
+            Ls = _vec_to_lower_triangular_2(self.corr_factor * p)
+            return K.at[:2, :2].set(Ls @ Ls.T)
         if self.only_bending_NN:
             K = jnp.zeros((3, 3))
             return K.at[2, 2].set(jax.nn.softplus(self.corr_factor * p[0]))
@@ -1158,6 +1185,41 @@ class StructuredBrazierCholeskyEnergyNN(eqx.Module):
     def __call__(self, del_strain: jax.Array) -> jax.Array:
         K = self.get_K_matrix(del_strain)
         return _reduced_strain_energy_from_K(K, del_strain)
+
+
+class StructuredSnappingBrazierCholeskyEnergyNN(StructuredBrazierCholeskyEnergyNN):
+    """
+    Same API as StructuredBrazierCholeskyEnergyNN, but with thresholded
+    snap-through softening.
+
+    The original Brazier law uses softplus(kappa - kappa_c), which is nonzero
+    below the critical curvature. This variant keeps the bending stiffness at
+    the unsoftened value until the corresponding positive or negative critical
+    curvature is exceeded, then decays exponentially toward rho_min.
+    """
+
+    def brazier_softening_factor(self, kappa1: jax.Array) -> jax.Array:
+        """
+        Returns s(kappa1) in [rho_min, 1].
+
+        Below the learned threshold, s == 1. Above it, the active side decays as
+        exp(-alpha * excess_curvature**2). Positive and negative bending
+        directions can have separate thresholds and decay rates in anisotropic
+        mode.
+        """
+        rho_min, kappa_c_pos, kappa_c_neg, alpha_pos, alpha_neg = (
+            self.get_brazier_params()
+        )
+
+        excess_pos = jnp.maximum(kappa1 - kappa_c_pos, 0.0)
+        excess_neg = jnp.maximum(-kappa1 - kappa_c_neg, 0.0)
+
+        decay = jnp.exp(
+            -alpha_pos * excess_pos**2
+            -alpha_neg * excess_neg**2
+        )
+
+        return rho_min + (1.0 - rho_min) * decay
 
 
 # ===================================================================================== #
