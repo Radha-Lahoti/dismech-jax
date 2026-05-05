@@ -34,8 +34,13 @@ def load_problem(
     split_lo = disp_min + test_range[0] * (disp_max - disp_min)
     split_hi = disp_min + test_range[1] * (disp_max - disp_min)
 
-    train_mask = (disps < split_lo) | (disps >= split_hi)
-    test_mask = (disps >= split_lo) & (disps < split_hi)
+    include_hi = test_range[1] >= 1.0
+    if include_hi:
+        train_mask = disps < split_lo
+        test_mask = disps >= split_lo
+    else:
+        train_mask = (disps < split_lo) | (disps >= split_hi)
+        test_mask = (disps >= split_lo) & (disps < split_hi)
 
     qs = jax.vmap(lambda d: slinky.get_q(d, q0))(disps)
     strains = jax.vmap(slinky.get_eps)(qs)

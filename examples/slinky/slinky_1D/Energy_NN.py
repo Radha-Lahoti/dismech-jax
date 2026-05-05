@@ -151,9 +151,14 @@ class ICNN_Energy(eqx.Module):
         return jax.nn.softplus(out).squeeze()
 
     def icnn_energy(self, eps):
-        # Zero-reference the learned energy correction so that:
-        # icnn_energy(0) = 0
-        return self._raw_icnn_energy(eps) - self._raw_icnn_energy(jnp.array(0.0))
+        # Subtract value AND gradient at 0 so that icnn_energy(0) = 0,
+        # icnn_energy'(0) = 0. Combined with the convexity of the raw ICNN,
+        # this makes 0 the global minimum, so icnn_energy(eps) >= 0 everywhere.
+        eps0 = jnp.array(0.0)
+        raw0 = self._raw_icnn_energy(eps0)
+        grad0 = jax.grad(self._raw_icnn_energy)(eps0)
+        eps_scalar = jnp.squeeze(eps)
+        return self._raw_icnn_energy(eps) - raw0 - grad0 * eps_scalar
 
     def baseline_energy(self, eps):
         eps_scalar = jnp.squeeze(eps)

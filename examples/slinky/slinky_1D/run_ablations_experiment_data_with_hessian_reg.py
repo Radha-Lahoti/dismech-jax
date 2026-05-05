@@ -1,5 +1,5 @@
 """
-Full ablation grid on experimental pulling-phase data (single seed).
+Full ablation grid on experimental pulling-phase data with Hessian regularization.
 
 Shared logic lives in ``ablation_*`` modules; this script selects overlay groups
 and writes summary tables and figures.
@@ -20,17 +20,17 @@ from ablation_plots_experiment import (
     plot_stiffness_strain_overlay,
     plot_summary_bars,
 )
-from ablation_training import train_one_case
+from ablation_training_with_reg import train_one_case
 
 
 def main():
-    out_root = "ablation_outputs_new_0.75_to_1.0"
+    out_root = "ablation_outputs_new_hessian_reg_1e-6"
     case_outdir = os.path.join(out_root, "cases")
     fig_outdir = os.path.join(out_root, "figures")
     ensure_dir(case_outdir)
     ensure_dir(fig_outdir)
 
-    problem = load_problem(data_path="experiment_data/pulling_phase_data.npz", test_range=(0.75, 1.0))
+    problem = load_problem(data_path="experiment_data/pulling_phase_data.npz", test_range=(0.2, 0.8))
     cases = build_case_list()
 
     results_by_name = {}
@@ -48,6 +48,9 @@ def main():
             log_freq=500,
             gradient_clip_norm=1.0,
             full_metrics=True,
+            hessian_reg_strength=1e-6,
+            hessian_reg_probes=1,
+            hessian_reg_seed=0,
         )
         save_case_outputs(case_outdir, final_model, result)
         results_by_name[case.name] = result

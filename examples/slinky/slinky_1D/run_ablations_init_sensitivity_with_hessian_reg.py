@@ -1,5 +1,5 @@
 """
-Multi-seed initialization sensitivity for a small set of architectures.
+Multi-seed initialization sensitivity with Hessian regularization.
 
 Shared logic lives in ``ablation_*`` modules; this script only wires cases,
 hyperparameters, saving, and figures.
@@ -15,11 +15,11 @@ from ablation_config import CaseConfig
 from ablation_data import load_problem
 from ablation_io import ensure_dir
 from ablation_plots_init import plot_all_init_figures
-from ablation_training import train_one_case
+from ablation_training_with_reg import train_one_case
 
 
 def main():
-    out_root = "seed_envelope_mlp_energy"
+    out_root = "seed_envelope_mlp_energy_hessian_reg_1e-4"
     run_dir = os.path.join(out_root, "runs")
     fig_dir = os.path.join(out_root, "figures")
     ensure_dir(run_dir)
@@ -53,6 +53,9 @@ def main():
                 log_freq=500,
                 gradient_clip_norm=1.0,
                 full_metrics=True,
+                hessian_reg_strength=1e-4,
+                hessian_reg_probes=1,
+                hessian_reg_seed=seed,
             )
 
             all_results[case.name].append(result)
