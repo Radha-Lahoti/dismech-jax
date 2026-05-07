@@ -19,9 +19,9 @@ util
 examples/slinky/slinky_1D/ablation_outputs/
 
 # Ignore specific files in the ablation_outputs directory
-*.json
+# *.json
 *.png
-*.npz
+# *.npz
 *.pdf
 *.eqx
 
@@ -40,6 +40,8 @@ hessian_reg_max_dlambda_*/
 ablation_outputs_*/
 all_architectures*/
 notebooks/
+
+slinky_2D_data/
 
 # any file whose name starts with "energy_arch"
 energy_arch_*
