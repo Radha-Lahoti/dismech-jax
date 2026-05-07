@@ -39,6 +39,7 @@ max_dlambda_*/
 hessian_reg_max_dlambda_*/
 ablation_outputs_*/
 all_architectures*/
+notebooks/
 
 # any file whose name starts with "energy_arch"
 energy_arch_*
