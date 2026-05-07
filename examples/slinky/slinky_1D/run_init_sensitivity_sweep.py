@@ -1,8 +1,8 @@
 """
-Multi-seed initialization sensitivity with Hessian regularization.
+Multi-seed initialization sensitivity sweep across architectures and test ranges.
 
-Shared logic lives in ``ablation_*`` modules; this script only wires cases,
-hyperparameters, saving, and figures.
+Runs ICNN_energy, MLP_energy, and MLP_Stiffness for three test_range splits
+and writes outputs into separate per-test-range directories.
 """
 
 import json
@@ -15,36 +15,53 @@ from ablation_config import CaseConfig
 from ablation_data import load_problem
 from ablation_io import ensure_dir
 from ablation_plots_init import plot_all_init_figures
-from ablation_training_with_reg import train_one_case
+from ablation_training import train_one_case
 
 
-def main():
-    out_root = "seed_envelope_mlp_energy_hessian_reg_1e-4_new_5-5-26"
+ARCHITECTURES = [
+    CaseConfig("energy_mlp_L2", "energy_mlp", (10, 10), "mlp"),
+    CaseConfig("energy_icnn_L2", "energy_icnn", (10, 10), "icnn"),
+    CaseConfig("stiffness_baseline_plus_mlp_L2", "stiffness_mlp", (10, 10), "combined"),
+]
+
+TEST_RANGES = [
+    (0.2, 0.8),
+    (0.0, 0.5),
+    (0.5, 1.0),
+]
+
+SEEDS = list(range(50))
+
+
+def test_range_dirname(test_range):
+    lo, hi = test_range
+    return f"seed_envelope_test_{lo:.1f}_{hi:.1f}".replace(".", "p")
+
+
+def run_for_test_range(test_range):
+    out_root = test_range_dirname(test_range)
     run_dir = os.path.join(out_root, "runs")
     fig_dir = os.path.join(out_root, "figures")
     ensure_dir(run_dir)
     ensure_dir(fig_dir)
 
+    print("#" * 90)
+    print(f"# test_range = {test_range}  ->  {out_root}")
+    print("#" * 90)
+
     problem = load_problem(
         data_path="experiment_data/pulling_phase_data.npz",
-        test_range=(0.2, 0.8),
+        test_range=test_range,
     )
 
-    cases = [
-        CaseConfig("energy_mlp_L2", "energy_mlp", (10, 10), "mlp"),
-        CaseConfig("energy_icnn_L2", "energy_icnn", (10, 10), "icnn"),
-        CaseConfig("stiffness_baseline_plus_mlp_L2", "stiffness_mlp", (10, 10), "combined"),
-    ]
-    seeds = list(range(50))
-
-    all_results = {case.name: [] for case in cases}
+    all_results = {case.name: [] for case in ARCHITECTURES}
     summary_rows = []
 
-    for case in cases:
+    for case in ARCHITECTURES:
         print("=" * 90)
         print(f"Running case: {case.name}")
 
-        for seed in seeds:
+        for seed in SEEDS:
             print(f"  seed = {seed}")
             model, result = train_one_case(
                 case=case,
@@ -55,9 +72,6 @@ def main():
                 log_freq=500,
                 gradient_clip_norm=1.0,
                 full_metrics=True,
-                hessian_reg_strength=1e-4,
-                hessian_reg_probes=1,
-                hessian_reg_seed=seed,
             )
 
             all_results[case.name].append(result)
@@ -65,6 +79,7 @@ def main():
                 {
                     "name": case.name,
                     "seed": seed,
+                    "test_range": list(test_range),
                     "train_mse": result["train_mse"],
                     "test_mse": result["test_mse"],
                 }
@@ -91,9 +106,15 @@ def main():
     with open(os.path.join(out_root, "summary.json"), "w") as f:
         json.dump(summary_rows, f, indent=2)
 
-    print("\nDone.")
-    print(f"Saved runs to:    {run_dir}")
-    print(f"Saved figures to: {fig_dir}")
+    print(f"\n[done] test_range={test_range}")
+    print(f"  runs:    {run_dir}")
+    print(f"  figures: {fig_dir}")
+
+
+def main():
+    for test_range in TEST_RANGES:
+        run_for_test_range(test_range)
+    print("\nAll test ranges complete.")
 
 
 if __name__ == "__main__":

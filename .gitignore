@@ -27,3 +27,21 @@ examples/slinky/slinky_1D/ablation_outputs/
 
 # codex-generated files
 .codex
+
+# anything within extra
+extra/
+
+# any folder whose name starts from "arch" or "seed"
+arch*/
+seed*/
+energy_arch*/
+max_dlambda_*/
+hessian_reg_max_dlambda_*/
+ablation_outputs_*/
+all_architectures*/
+
+# any file whose name starts with "energy_arch"
+energy_arch_*
+
+
+*.log
